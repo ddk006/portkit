@@ -1,0 +1,15 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "jb-dashboard",
+      "runtimeExecutable": ".venv/bin/python",
+      "runtimeArgs": [
+        "-I",
+        "bb/joebox/dashboard.py",
+        "8765"
+      ],
+      "port": 8765
+    }
+  ]
+}
