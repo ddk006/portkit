@@ -105,3 +105,17 @@ def stream_read(cpu):
     print("WATCH read this=0x%x r1=0x%x pos=0x%x asset=%d a1=0x%x a2=0x%x cnt=%d lr=0x%x" % (
         r(0), r(1), (r(3) << 32) | r(2), cpu.Bus.ReadDoubleWord(sp), cpu.Bus.ReadDoubleWord(sp + 4),
         cpu.Bus.ReadDoubleWord(sp + 8), cpu.Bus.ReadDoubleWord(sp + 0xc), r(14)))
+
+
+def stream_trace(cpu):
+    """Stream cache read 0x0805B350: report jumps back in the read position (loop wraps) and a sparse trace."""
+    r = lambda k: int(cpu.GetRegisterUnsafe(k).RawValue)
+    pos = (r(3) << 32) | r(2)
+    asset = cpu.Bus.ReadDoubleWord(int(cpu.SP.RawValue))
+    key = "tr%d" % asset
+    last, n = _seen.get(key, (None, 0))
+    if last is not None and pos < last:
+        print("WATCH jump asset %d: %d -> %d" % (asset, last, pos))
+    elif n % 1500 == 0:
+        print("WATCH pos asset %d: %d" % (asset, pos))
+    _seen[key] = (pos, n + 1)

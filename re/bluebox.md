@@ -124,6 +124,12 @@ Gewünscht (Kyrill, 2026-10-25): Loops von 1..16 Takten auf **2 Slots**, **24 Bi
 aufnehmen und von SD abspielen, Ausblenden mit Filter. Projektwechsel (= "Preset" bei Kyrill) muss den Loop
 **nicht** überleben. Weg: eingebauter Recorder/Player, ergänzt um taktgenaue Länge, Wiederholung und Filter-Fade.
 
+- **Prototyp `loop` (2026-10-26, `bluebox/src/loop_m7.c`):** Wrapper um `FUN_08057A00` an den drei Aufrufstellen.
+  Unicorn (`tests/test_bluebox_loop.py`): 8/8. Renode (480/240 MIPS, sauberer 440-Hz-Sinus als Clip, 3,013 s):
+  Ausgang (Slots 2/3) läuft bis zum Ende des Mitschnitts weiter, stock endet nach 3,1 s; Sprünge der Leseposition
+  144597 -> 4 und 144612 -> 19 (Clip 144625 Samples), Abstand der Sprünge 3,013 s (keine Drift); an jedem Sprung ein
+  Knackser (Signalsprung 185x / 480x über der Sinuskrümmung). SRAM4 unter 0x3800F000 blieb während des Laufs
+  unberührt (Canary). Nicht am Gerät gehört.
 - RAM-Rechnung: frei ~6,4 MB (1,5 + 4,9). 24 Bit mono 3 MB je Slot = 21,8 s (16 Takte nur ab ~176 BPM),
   stereo 10,9 s. Daher SD.
 - Einhängepunkt: noch offen; Kandidaten sind die Kanalkette (Bus 0..11 vor dem Mixer `b988`) oder der Mixer selbst.

@@ -21,7 +21,8 @@ KEYS = {"E0": (0, 0), "E1": (0, 1), "F9_0": (1, 0), "F9_1": (1, 1), "F9_5": (1, 
 TOUCH_FLIP_Y = False                                     # orientation of the GT911 y axis: to be checked
 SHOTS = []
 ROT = ["--rot", "0"]                                     # the LTDC frame is already landscape (320 x 240)
-IMAGES = {"stock": os.path.join(ROOT, "firmware", "BLUEEURO.BIN")}
+IMAGES = {"stock": os.path.join(ROOT, "firmware", "BLUEEURO.BIN"),
+          "loop": os.path.join(ROOT, "out", "bluebox", "loop", "BLUEEURO.BIN")}
 
 
 def body(path):

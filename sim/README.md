@@ -107,3 +107,7 @@ Simulation beantwortet ReadPin per Hook (`bbhook.key_read`). Ereigniscodes je Ze
 Zugeordnet: STOP (Code 0xF6), PLAY (0xF7), REC (0xF4); E0/E1 und F9_0..7 (Seitentasten/Encoder?) offen.
 Aufnahme: `tap 287 220` (Rec-Reiter), `tap 36 60` (Kanal 1 scharf), `press PLAY`, `press REC`, ..., `press STOP`.
 Audio-Eingang: `mon 'python "self.Machine[\"sysbus.audioDma\"].InputFrom(5, \"<raw>\")"'` (TDM 8 x 32 Bit).
+Looper-Prototyp in der Simulation (2026-10-26): `--image loop` (out/bluebox/loop). Kerntakt jetzt 480 / 240 MIPS
+(`bluebox_boot.resc`); vorher verpasste der M7 Audioblöcke (Aufnahme zu hoch, Mitschnitt mit Wiederholungen).
+Ausgang mitschneiden: `mon 'python "self.Machine[\"sysbus.audioDma\"].CaptureTo(1, \"<raw>\")"'` ... `CaptureStop()`;
+Main-Out liegt in Slot 2/3 (TDM 8 x 32 Bit). `bbhook.stream_trace` (Hook 0x0805B350) meldet Sprünge der Leseposition.

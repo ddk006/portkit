@@ -12,6 +12,10 @@ cpu1 VectorTableOffset 0x08100000
 cpu1 SP `sysbus ReadDoubleWord 0x08100000`
 cpu1 PC `sysbus ReadDoubleWord 0x08100004`
 logLevel 2
+# Realistic core speeds (H7 dual core: M7 480 MHz, M4 240 MHz). At Renode's default 100 MIPS the M7 misses audio
+# blocks: recordings come out pitched up and captures repeat blocks (seen 2026-10-26).
+cpu PerformanceInMips 480
+cpu1 PerformanceInMips 240
 # DMA2D workarounds as for the micro (sim/boot.resc)
 sysbus WriteDoubleWord 0x5200101C 0x1
 sysbus WriteDoubleWord 0x5200101C 0x0
