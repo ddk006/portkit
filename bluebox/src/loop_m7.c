@@ -103,7 +103,12 @@ struct loop_state {
         int32_t fade_left, fade_total;   /* samples; fade_total 0 = not fading */
         uint8_t fading;           /* LOOP went off with FADE > 0: the loop keeps its slot until the fade ends */
         uint8_t seen;             /* a looping voice of this track rendered since the last loop_process */
-        uint8_t _p[2];
+        uint8_t auto_wait;        /* a moved clip has no voice yet: plan it again each block */
+        uint8_t _p;
+        uint32_t auto_asset;      /* the clip autostart last moved (not again), 0xFFFFFFFF = none */
+        uint32_t pend_asset;      /* a moved clip whose voice is still to come: its loop region below */
+        int32_t pend_start;       /* file position of the loop start, samples */
+        int64_t pend_lenq;        /* loop length, 48.16 */
     } fx[TRACKS];
     /* the block being rendered (set by loop_voice around the stock voice call, read by loop_read) */
     int32_t cur_track;            /* -1 = none */
@@ -111,13 +116,14 @@ struct loop_state {
     float cur_g0, cur_g1;         /* gain ramp across the block */
     float cur_fg, cur_fk;         /* filter coefficients for the block */
     int32_t cur_mode;
+    uint32_t autostarts;          /* for tests */
 };
 #include <stddef.h>
 _Static_assert(sizeof(struct loop_slot) == 56 && offsetof(struct loop_state, slot) == 16, "state layout (tests, sim)");
 _Static_assert(offsetof(struct loop_state, owner) == 0x710 && offsetof(struct loop_state, chbars) == 0x712 &&
                offsetof(struct loop_state, want) == 0x71e, "state layout (tests, sim)");
 #define LS ((volatile struct loop_state *)0x3800F000u)
-#define LS_MAGIC 0x354f4f4cu      /* "LOO5": layout version; any other value (old layout, power-up) re-initialises */
+#define LS_MAGIC 0x374f4f4cu      /* "LOO7": layout version; any other value (old layout, power-up) re-initialises */
 #define P_QUEUE 0x18              /* the player node's queue id = its channel */
 #define T_BPM 0x18                /* transport: float tempo */
 #define T_POS 0x30                /* transport: int64 position, ticks */
@@ -147,8 +153,12 @@ static struct loop_state *state(void)
             f->fading = 0;
             f->fade_total = f->fade_left = 0;
             f->mode0 = 0;
+            f->auto_asset = 0xffffffffu;
+            f->auto_wait = 0;
+            f->pend_asset = 0xffffffffu;
         }
         s->cur_track = -1;
+        s->autostarts = 0;
         s->magic = LS_MAGIC;
     }
     return s;
@@ -315,6 +325,90 @@ static void fx_apply(struct loop_state *s, float *x, float *ic, int n)
 static void set_loop(struct loop_state *s, unsigned track, int on);
 static void release(struct loop_state *s, unsigned track);
 
+/* ---- a freshly recorded clip loops at once ----
+ * The track player (the channel's first node, vtable 0x0806BFDC, process 0x08057B70) keeps its clips at +0x98 (0x28
+ * bytes each: +0x08 asset, +0x10 int64 start, +0x18 int64 end, +0x20 int64 offset into the file, all in ticks;
+ * count +0x598) and two voices at +0x20 / +0x58. It starts a clip's voice when the transport reaches the clip, so a
+ * clip that was just recorded (the transport is past its end when it appears) would not play until the transport
+ * comes back. autostart moves the clip entry instead: it now starts a 16th from now, at the loop's phase of that
+ * moment (offset = loop start + ((start - loop start) mod loop length)), and lets the stock plan it from the transport
+ * (0x08057900(player, -, ctx), what the player does at PLAY on message 0x57; after that it plans only while a voice
+ * plays, so a clip arriving on a silent track would wait for the next PLAY). The stock start (0x0805779C) needs the
+ * file's length from the stream cache (vtable +0x14); right after a take the M4 streamer registers the file again and
+ * the length is unknown (-1) for a moment, so the planning is repeated each block until a voice runs (auto_wait).
+ * The loop region is handed to loop_voice through the track's pend_* fields. Taken: the clip of this track that ended
+ * at most eight bars ago, once per clip. */
+struct clip { uint32_t _0, _4, asset, _c; int64_t start, end, offset; };
+#define PL_CLIPS 0x98
+#define PL_COUNT 0x598
+#define PL_VOICE_A 0x20
+#define PL_VOICE_B 0x58
+#define PL_INDEX 0x5a0
+#define fw_plan ((void (*)(void *, uint32_t, uint32_t))FN(0x08057900))
+#define AUTO_WAIT_BLOCKS 200      /* ~133 ms of retries */
+#define LEAD_TICKS 240            /* a moved clip starts this far ahead (a 16th) */
+
+static void autostart(struct loop_state *s, uint8_t *player, void *bus, uint32_t a3, unsigned track)
+{
+    (void)bus;
+    struct voice *va = (struct voice *)(player + PL_VOICE_A), *vb = (struct voice *)(player + PL_VOICE_B);
+    uint8_t *t = a3 ? *(uint8_t **)a3 : 0;
+    struct track_fx *f = &s->fx[track];
+    if (va->active || vb->active || !t) {
+        f->auto_wait = 0;
+        return;
+    }
+    if (f->auto_wait) {
+        f->auto_wait--;
+        fw_plan(player, 0, a3);
+        return;
+    }
+    float bpm = *(float *)(t + T_BPM);
+    unsigned bars = s->chbars[track] ? s->chbars[track] : s->bars;
+    int32_t count = *(int32_t *)(player + PL_COUNT);
+    if (bpm < 1.f || !bars || count <= 0 || count > 256)
+        return;
+    if (bars > MAX_BARS)
+        bars = MAX_BARS;
+    int32_t now = (int32_t)*(int64_t *)(t + T_POS);
+    struct clip *c = 0;
+    int32_t ci = 0;
+    for (int32_t i = 0; i < count; i++) {
+        struct clip *k = (struct clip *)(player + PL_CLIPS) + i;
+        int32_t end = (int32_t)k->end;
+        if (end <= now && now - end < 8 * BAR_TICKS && k->asset != f->auto_asset && (!c || end > (int32_t)c->end)) {
+            c = k;
+            ci = i;
+        }
+    }
+    if (!c)
+        return;
+    f->auto_asset = c->asset;                            /* once per clip */
+    int32_t cs = (int32_t)c->start, ce = (int32_t)c->end;
+    int32_t ls = (cs + BAR_TICKS - 1) / BAR_TICKS * BAR_TICKS;    /* the loop starts on the first bar line */
+    while (bars && ls + (int32_t)bars * BAR_TICKS + 16 > ce)
+        bars--;                                          /* (16 ticks: room for the crossfade at 120 BPM and up) */
+    if (!bars || now < ls)
+        return;
+    /* move the clip so that it starts a 16th from now, at the loop's phase of that moment: the player starts it like
+     * any coming clip (the stock start needs the file's length, which the stock streaming learns for coming clips) */
+    int32_t lt = (int32_t)bars * BAR_TICKS, st = now + LEAD_TICKS, phase = (st - ls) % lt;
+    c->start = st;
+    c->offset = c->offset + (ls - cs) + phase;
+    c->end = st + (ce - ls - phase);
+    *(int32_t *)(player + PL_INDEX) = ci;
+    double spt = 48000.0 * 60.0 / (960.0 * bpm);
+    f->pend_asset = c->asset;
+    f->pend_start = (int32_t)((double)(int32_t)(c->offset - phase) * spt + 0.5);
+    double q = (double)lt * spt * 65536.0 + 0.5;
+    uint32_t hi = (uint32_t)(q / 4294967296.0);
+    uint32_t lo = (uint32_t)(q - (double)hi * 4294967296.0);
+    f->pend_lenq = ((int64_t)hi << 32) | lo;
+    s->autostarts++;
+    f->auto_wait = AUTO_WAIT_BLOCKS;
+    fw_plan(player, 0, a3);
+}
+
 void loop_voice(void *player, void *voice, void *bus, uint32_t a3)
 {
     struct loop_state *s = state();
@@ -342,8 +436,21 @@ void loop_voice(void *player, void *voice, void *bus, uint32_t a3)
         fw_voice(player, voice, bus, a3);
         return;
     }
-    if (sl->len <= 0 || sl->asset != v->asset || v->pos + v->left != sl->cend)
-        region(sl, v, a3, track < TRACKS && s->chbars[track] ? s->chbars[track] : s->bars);   /* new clip */
+    if (sl->len <= 0 || sl->asset != v->asset || v->pos + v->left != sl->cend) {
+        struct track_fx *pf = track < TRACKS ? &s->fx[track] : 0;
+        if (pf && pf->pend_asset == v->asset) {          /* a clip autostart moved: its region is known */
+            pf->pend_asset = 0xffffffffu;
+            sl->asset = v->asset;
+            sl->passes = 0;
+            sl->acc = 0;
+            sl->xf0 = 0;
+            sl->cend = v->pos + v->left;
+            sl->start = pf->pend_start;
+            sl->lenq = pf->pend_lenq;
+            sl->len = sl->lenq >> 16;
+        } else
+            region(sl, v, a3, track < TRACKS && s->chbars[track] ? s->chbars[track] : s->bars);   /* new clip */
+    }
     int64_t n = fw_frames(bus);
     if (track < TRACKS && s->fx[track].fading && s->fx[track].fade_total && s->fx[track].fade_left <= 0) {
         /* the fade is over: give the slot back and end the clip at this block (silent by now) */
@@ -420,6 +527,18 @@ static void release(struct loop_state *s, unsigned track)
         for (unsigned t = 0; !s->owner[i] && t < TRACKS; t++)
             if ((s->want >> t & 1) && !owns(s, t))
                 s->owner[i] = (uint8_t)(t + 1);
+}
+
+/* the track player's process (vtable 0x0806BFDC slot 3, 0x08057B70(player, ctx)): with no voice playing it does not
+ * render voices, so autostart runs here, every block; ctx is what the voices get as a3 (its first word -> transport) */
+#define fw_player_proc ((process_fn)FN(0x08057b70))
+int loop_player(void *obj, void *ctx)
+{
+    struct loop_state *s = state();
+    unsigned track = *(uint32_t *)((uint8_t *)obj + P_QUEUE);
+    if (track < TRACKS && looping(s, track) && !s->fx[track].fading)
+        autostart(s, obj, 0, (uint32_t)ctx, track);
+    return fw_player_proc(obj, ctx);
 }
 
 int loop_process(void *obj, void *ctx)

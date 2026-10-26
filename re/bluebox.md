@@ -104,7 +104,8 @@ Ducker `duck*` (0x01F..0x02B); Track-Recorder mit Transport (`trackplay`, `trans
   trackendtm="7036" trackplay="1"/>` -> Zeiten in Ticks, **960 PPQ** (5785 Ticks = 3,013 s bei 120 BPM).
   Pegel/Frequenz der Aufnahme passen nicht zum eingespeisten Sinus (0 dBFS, ~630 Hz statt -6 dB, 440 Hz):
   vermutlich Artefakt der Einspeisung in der Simulation, nicht geprüft.
-- **Track-Player = Kanalknoten `vt_bf74`** (process 0x080574EC, Player-Funktion 0x08057B78). Er rendert Clips als
+- **Track-Player = erster Kanalknoten `vt_bfdc`** (vtable 0x0806BFDC, process 0x08057B70; korrigiert in L7, vorher
+  hier `vt_bf74`, dessen Prozess 0x080574EC nur die Parameter-Events der Spur liest). Er rendert Clips als
   Stimmen über `FUN_08057A00(player, voice, bus, ?)` (3 Aufrufe 0x08057D1E / 0x08057EF8 / 0x08057F06), die den
   Cache über `vtable[2]` liest (Aufruf 0x08057A92; Cache-Objekt 0x10044270 = SRAM3 0x30044270, vom M4 angelegt
   und gefüllt). Gelesen wird in Blöcken zu 32 Samples ab Asset-Sample 0 (emu).
@@ -185,6 +186,40 @@ aufnehmen und von SD abspielen, Ausblenden mit Filter. Projektwechsel (= "Preset
   Objekt -> eigene Widgets in SRAM4 0x3800A000. B schaltet Block 1 -> Block 2 -> Loop -> Block 1; in der Loop-Ansicht
   Regler in Block 2s Rahmen (Encoder 1 FILTER, 2 BARS, 3 FADE), LOOP rechts. LOOP-Tipp setzt im M7 den Slot (emu).
   Fix: LOOP aus mit FADE, während nichts spielt, gibt den Slot sofort frei (vorher blieb er belegt).
+- **Aufnahme, die nach BARS Takten endet und sofort loopt (Build 1.5.1L7, emu):**
+  - REC = App-Nachricht 0x69 (STOP 0x6C, kommt auch direkt nach REC); Codes < 0x7B -> 0x0813AA90 (bl @0x08135B24).
+    Take beenden = 0x081272CC(store, 0) (Record aus): läuft ein Take (store + 0x743B), setzt 0x08127150 sein Ende,
+    stellt das Schließen der Datei als Auftrag 0xC in die Recorder-Queue (0x0810A8FC) und schickt den Clip an den M7
+    (0x08125040). Der Transport läuft weiter; stock beendet Takes nur bei STOP.
+  - **Punch In/Out per 0x08126524 bei laufendem Transport geht nicht:** der Take wurde angemeldet (`assets.xml`,
+    Start = REC-Zeitpunkt statt Punch In), die WAV aber nie geschrieben (keine `_01-1-…` Temp-Datei, Karte bis auf
+    die XML unverändert). Stock und L7 ohne LOOP schreiben die WAV (Gegenprobe). Daher setzt L7 keinen Punch mehr:
+    Aufnahme ab REC wie stock, `loop_tick` (am Redraw-Check bl @0x081351A6) schaltet Record bei
+    nächster Taktlinie (>= 1/16 nach REC) + BARS Takte + 1/16 aus.
+  - Länge im Cache: 0x0810C608(cache, asset, rate, ?, int64 Länge) setzt Slot +0x1B20 (Aufrufer 0x0810B4C6,
+    0x0810B940 (8f6: Länge 0), 0x0810BAEC (9e4: Datengröße aus dem WAV-Header / Blockgröße)). Nach dem Take meldet der
+    Streamer die Datei neu an (Zuordnung kurz 0xFFFF). Getter 0x0805AC88 liefert -1 ohne Zuordnung.
+  - **Player-Flags:** +0x94 = eine Stimme läuft (gesetzt vom Start 0x0805779C; nur dann rendert/plant er), +0x95 =
+    Wiedergabe-Status (Parameter 0x16D über 0x39-Event), +0x96 = Rec Enable (0x162). Nachricht 0x57 (bei PLAY) plant
+    mit +0x95 die Clips: 0x08057900(player, -, ctx) -> Start 0x0805779C (zweites Argument wird nicht gelesen).
+    Ein Clip, der auf einer stillen Spur bei laufendem Transport dazukommt, startet stock erst beim nächsten PLAY.
+    Event-Ids im Player (0x39, Sprungtabelle 0x08057E04): 0x162 -> +0x96, 0x166/0x167/0x168/0x16B/0x16F Clip-Felder,
+    0x16C Anzahl, 0x16D -> +0x95.
+  - **Rec Enable schaltet die Clips der Spur stumm:** ist +0x96 gesetzt und nimmt der Transport nicht auf
+    (Transport +0x38 = 0), nimmt der Render-Zweig @0x08057CA4 -> 0x08057E50 den Eingang statt der Clips (Renode:
+    Loop lief, Ausgang 0,000; nach Rec Enable aus 0,70).
+  - L7: `autostart` verschiebt den Clip (Start jetzt + 1/16, Versatz = Loop-Phase) und ruft die Planung 0x08057900
+    selbst auf, bis 200 Blöcke lang wiederholt, bis eine Stimme läuft; der M4 schaltet Rec Enable der Loop-Spuren
+    nach dem Take per 0x6E an 0x08126E8C aus.
+  - **Stream-Fehler in der Kopfzeile:** 0x08122C08 -> Statusfeld +0x18 = Cache +0x362C + 0x3000E634; 1 -> "REC ERROR",
+    > 1 -> "ERROR %d" (statt freiem Speicher). Endet ein Take bei laufendem Transport, liest der Mixer `b988`
+    (0x08050564 -> 0x0805012C -> 0x0805AD1A, liest die aufnehmende Spur an der Schreibposition) ~8 Ticks lang ins
+    Leere: 7 Fehler (Ticks 8024..8032 nach Take-Ende 7920, Zähler 0x0805B05C). Stock mit STOP: keine. L7 zählt
+    Fehler in den ersten 480 Ticks nach dem Take zurück. Hörbar vermutlich ~5 ms Lücke im Mithören am Take-Ende
+    (nicht verifiziert).
+  - Renode (frische Karte, 120 BPM, BARS 1, 440-Hz-Eingang, REC bei Tick ~1690, Eingang ab 4,4 s still): WAV
+    958200 Byte (24 Bit stereo), Take-Ende 7920, Loop ab Taktlinie 3840 mit 95968/96000 Samples, Ausgang ab Take-Ende
+    durchgehend 0,70 (Loop), Kopfzeile ohne Fehler.
 - RAM-Rechnung: frei ~6,4 MB (1,5 + 4,9). 24 Bit mono 3 MB je Slot = 21,8 s (16 Takte nur ab ~176 BPM),
   stereo 10,9 s. Daher SD.
 - Einhängepunkt: noch offen; Kandidaten sind die Kanalkette (Bus 0..11 vor dem Mixer `b988`) oder der Mixer selbst.

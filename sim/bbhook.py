@@ -156,3 +156,16 @@ def inject(machine, dest, pid, value):
     bus.WriteBytes(System.Array[System.Byte](bytearray(entry)), 0x30040000 + 24 * (w & 0xFF))
     bus.WriteDoubleWord(0x30041804, w + 1)
     print("WATCH inject dest %d id 0x%x value %d (write index %d)" % (dest, pid, value, w))
+
+
+def app_msg(machine, code, w8=0, wc=0, w10=0):
+    """Put a UI message into the M4 app queue (object 0x30018010: 128 x 24 bytes, read +0xC00, write +0xC04), e.g.
+    0x32 = encoder turned (+0x0C index, +0x10 delta)."""
+    import struct
+    bus = machine.SystemBus
+    q = 0x30018010
+    w = bus.ReadDoubleWord(q + 0xC04)
+    entry = struct.pack("<HxxIHxxiiI", code, 0x0814B0F0, w8, wc, w10, 0)
+    bus.WriteBytes(System.Array[System.Byte](bytearray(entry)), q + 24 * (w & 0x7F))
+    bus.WriteDoubleWord(q + 0xC04, w + 1)
+    print("WATCH app msg 0x%x (%d, %d, %d) at %d" % (code, w8, wc, w10, w))

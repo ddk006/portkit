@@ -20,7 +20,7 @@ OUT = os.path.join(ROOT, "out", "bluebox")
 STOCK = os.path.join(ROOT, "firmware", "BLUEEURO.BIN")
 STOCK_SHA256 = "fcb04565e2fd5bc15c0b2d0dc913dc99dc74732611e8cef0d7e8e4bb4af7402b"
 BASE = 0x08040000                       # the file is contiguous flash from here (re/bluebox.md)
-VERSION = (0x08149640, b"1.5.1\0\0\0", b"1.5.1L6\0")
+VERSION = (0x08149640, b"1.5.1\0\0\0", b"1.5.1L7\0")
 
 # M7 cave: inside the zero-filled gap 0x0808AC00..0x08090000, below every cave bluelex uses (0x08090000..)
 CAVE7 = (0x0808C000, 0x2000)
@@ -67,7 +67,10 @@ def feature_loop():
     sites = (0x08057D1E, 0x08057EF8, 0x08057F06)             # the track player's calls of FUN_08057A00
     patches = [(CAVE7[0], bytes(len(code)), code, "loop7 cave"), (CAVE4[0], bytes(len(code4)), code4, "loop4 cave")]
     patches += [(a, bl(a, 0x08057A00), bl(a, s["loop_voice"]), "voice -> loop_voice") for a in sites]
-    # track player node vtable 0x0806BF74, slot 3 (process 0x080574EC) -> loop_process (LOOP / BARS per track)
+    # track player vtable 0x0806BFDC, slot 3 (process 0x08057B70) -> loop_player (a fresh loop take starts at once)
+    patches.append((0x0806BFE8, struct.pack("<I", 0x08057B71), struct.pack("<I", s["loop_player"] | 1),
+                    "player proc ptr = loop_player"))
+    # channel node vtable 0x0806BF74, slot 3 (process 0x080574EC) -> loop_process (LOOP / BARS per track)
     patches.append((0x0806BF80, struct.pack("<I", 0x080574ED), struct.pack("<I", s["loop_process"] | 1),
                     "player process ptr = loop_process"))
     # M4: parameter table, last definition (id 0x117) -> loop_defs; channel set, add of id 0x2A -> loop_set_add
@@ -82,12 +85,18 @@ def feature_loop():
                     "setBlock -> loop_setblock"))
     patches.append((0x0814E608, struct.pack("<I", 0x081342AD), struct.pack("<I", s4["loop_msg"] | 1),
                     "track page msg ptr = loop_msg"))
+    # M4: the app's hand-over of messages below 0x7B to the page manager -> loop_app_msg (REC with a loop track)
+    patches.append((0x08135B24, bl(0x08135B24, 0x0813AA90), bl(0x08135B24, s4["loop_app_msg"]),
+                    "pm msg -> loop_app_msg"))
+    # M4: UI loop, its redraw check (bl 0x0813AA9E @0x081351A6) -> loop_tick (ends the loop take, Rec Enable off)
+    patches.append((0x081351A6, bl(0x081351A6, 0x0813AA9E), bl(0x081351A6, s4["loop_tick"]), "redraw -> loop_tick"))
     # stream cache vtable 0x08076BD4, slot 2 (read 0x0805B350) -> loop_read (crossfade at the loop point)
     patches.append((0x08076BDC, struct.pack("<I", 0x0805B351), struct.pack("<I", s["loop_read"] | 1),
                     "cache read ptr = loop_read"))
     targets = {s["loop_voice"] & ~1: "loop_voice", s4["loop_defs"] & ~1: "loop_defs",
                s4["loop_set_add"] & ~1: "loop_set_add", s4["loop_track_ctor"] & ~1: "loop_track_ctor",
-               s4["loop_show"] & ~1: "loop_show", s4["loop_setblock"] & ~1: "loop_setblock"}
+               s4["loop_show"] & ~1: "loop_show", s4["loop_setblock"] & ~1: "loop_setblock",
+               s4["loop_app_msg"] & ~1: "loop_app_msg", s4["loop_tick"] & ~1: "loop_tick"}
     return patches, targets, {"loop7": len(code), "loop7_free": CAVE7[1] - len(code), "loop4": len(code4),
                               "loop4_free": CAVE4[1] - len(code4)}
 

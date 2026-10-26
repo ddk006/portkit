@@ -44,6 +44,7 @@ BUFL, BUFR, BUFT = 0x24002000, 0x24002400, 0x24002800
 TRANSPORT, A3 = 0x24003000, 0x24003100
 FW_QUEUE, FW_NEXT_EV, FW_PLAYER, QUEUE = 0x08053C8C, 0x0804E938, 0x080574EC, 0x24004000
 FW_DEF, FW_ADD = 0x08135E08, 0x081205E2
+FW_PLAN, PL2, FW_PLAYER_PROC = 0x08057900, 0x24005000, 0x08057B70
 OWNER, CHBARS, WANT = STATE + 0x710, STATE + 0x712, STATE + 0x71E
 CHFILTER, CHFADE = STATE + 0x720, STATE + 0x738
 W = 2 * 3.141592653589793 * 440 / 48000
@@ -71,8 +72,9 @@ class Emu:
         self.sym = self.symbol("loop_voice")
         self.sym_read = self.symbol("loop_read")
         self.sym_proc = self.symbol("loop_process")
-        self.events, self.player_calls, self.m4_calls = [], 0, []
-        for a in (FW_QUEUE, FW_NEXT_EV, FW_PLAYER, FW_DEF, FW_ADD):
+        self.events, self.player_calls, self.m4_calls, self.vstarts = [], 0, [], 0
+        self.vstart_calls, self.fail_calls = 0, 0
+        for a in (FW_QUEUE, FW_NEXT_EV, FW_PLAYER, FW_DEF, FW_ADD, FW_PLAN, FW_PLAYER_PROC):
             self.uc.hook_add(UC_HOOK_CODE, self.api_stub, begin=a, end=a)
         self.file_len = 1 << 40
         self.a3 = 0
@@ -97,6 +99,28 @@ class Emu:
                 uc.reg_write(UC_ARM_REG_R0, 1)
             else:
                 uc.reg_write(UC_ARM_REG_R0, 0)
+        elif addr == FW_PLAN:                            # stock planning + voice start, as read (re/bluebox.md)
+            self.vstart_calls += 1
+            player, a3 = r(UC_ARM_REG_R0), r(UC_ARM_REG_R2)
+            idx = struct.unpack("<i", bytes(uc.mem_read(player + 0x5A0, 4)))[0]
+            clip = player + 0x98 + 0x28 * idx
+            _, _, asset, _, cstart, cend, coff = struct.unpack("<IIIIqqq", bytes(uc.mem_read(clip, 0x28)))
+            t = struct.unpack("<I", bytes(uc.mem_read(a3, 4)))[0]
+            bpm = struct.unpack("<f", bytes(uc.mem_read(t + 0x18, 4)))[0]
+            now = struct.unpack("<q", bytes(uc.mem_read(t + 0x30, 8)))[0]
+            smp = lambda tk: int(tk / 960 / bpm * 60 * 48000 + 0.5)
+            if self.vstart_calls > self.fail_calls:     # file length known to the cache by then
+                if now < cstart:                        # coming clip: voice waits (delay), then plays from offset
+                    pos, left, delay = smp(coff), smp(cend) - smp(cstart), smp(cstart) - smp(now)
+                else:                                   # mid-clip
+                    pos, left, delay = smp(coff + now - cstart), smp(cend) - smp(now), 0
+                if left > 0:
+                    va = struct.unpack("<B", bytes(uc.mem_read(player + 0x20, 1)))[0]
+                    v = player + (0x58 if va else 0x20)
+                    uc.mem_write(v, struct.pack(VOICE_FMT, 1, 0, asset, pos, delay, left))
+                    self.vstarts += 1
+        elif addr == FW_PLAYER_PROC:
+            uc.reg_write(UC_ARM_REG_R0, 0)
         elif addr == FW_PLAYER:
             self.player_calls += 1
             uc.reg_write(UC_ARM_REG_R0, 77)
@@ -132,28 +156,32 @@ class Emu:
         o = bytes(self.uc.mem_read(OWNER, 2))
         return [b - 1 if b else None for b in o]
 
-    def voice(self, **kw):
+    def voice(self, at=VOICE, **kw):
         cur = dict(zip(("active", "ending", "asset", "pos", "delay", "left"),
-                       struct.unpack(VOICE_FMT, bytes(self.uc.mem_read(VOICE, 0x28)))))
+                       struct.unpack(VOICE_FMT, bytes(self.uc.mem_read(at, 0x28)))))
         if kw:
             cur.update(kw)
-            self.uc.mem_write(VOICE, struct.pack(VOICE_FMT, *(cur[k] for k in
+            self.uc.mem_write(at, struct.pack(VOICE_FMT, *(cur[k] for k in
                               ("active", "ending", "asset", "pos", "delay", "left"))))
         return cur
 
     def stub(self, uc, addr, size, _):
         if addr == FW_FRAMES:
             uc.reg_write(UC_ARM_REG_R0, N)
-        else:                                          # stock voice model
-            v = self.voice()
-            if v["active"]:
+        else:                                          # stock voice model, on the voice passed in r1
+            at = uc.reg_read(UC_ARM_REG_R1)
+            v = self.voice(at)
+            if v["active"] and v["delay"] > 0:
+                v["delay"] = max(0, v["delay"] - N)
+                self.voice(at, **v)
+            elif v["active"]:
                 self.reads.append(v["pos"])
                 v["pos"] += N
                 if not v["ending"]:
                     v["left"] -= N
                     if v["left"] < 1:
                         v["active"] = 0
-                self.voice(**v)
+                self.voice(at, **v)
         uc.reg_write(UC_ARM_REG_PC, uc.reg_read(UC_ARM_REG_LR))
 
     def read_stub(self, uc, addr, size, _):
@@ -358,6 +386,65 @@ def main():
     check(calls == [("def", "0x117"), ("def", "0x103"), ("def", "0x104"), ("def", "0x105"), ("def", "0x107"),
                     ("add", "0x2a"), ("add", "0x103"), ("add", "0x104"), ("add", "0x105"), ("add", "0x107")],
           "M4: stock call first, then LOOP, BARS, FILTER, FADE: %s" % calls)
+    # M4: a REC with a LOOP track ends the take BARS bars after the next bar line, the transport is not touched
+    def rec_run(params, rec_at, ticks_end=40000, step=24, take_flag_after=10):
+        e = Emu()
+        uc = e.uc
+        uc.mem_map(0x30000000, 0x50000)
+        calls = []
+        ticks = [rec_at]
+        errs = [None]
+        ERRS = 0x30044270 + 0x362C
+        uc.mem_write(ERRS, struct.pack("<I", 3))
+        def m4stub(uc, addr, size, _):
+            r = lambda k: uc.reg_read(k)
+            if addr == 0x08122580:                      # get(store, &set, &id, &val)
+                st = struct.unpack("<H", bytes(uc.mem_read(r(UC_ARM_REG_R1), 2)))[0]
+                pid = struct.unpack("<H", bytes(uc.mem_read(r(UC_ARM_REG_R2), 2)))[0]
+                uc.mem_write(r(UC_ARM_REG_R3), struct.pack("<i", params.get((st, pid), 0)))
+            elif addr == 0x081272CC:                    # record on/off
+                calls.append(("setrec", r(UC_ARM_REG_R1), ticks[0]))
+                uc.mem_write(0x30018010 + 0x743B, b"\0")
+                errs[0] = ticks[0]                      # the Mixer's misses follow (see loop_ui_m4.c)
+            elif addr == 0x08126524:
+                calls.append(("transport", 0, ticks[0]))
+            elif addr == 0x08126E8C:                    # store message: 0x6E param set
+                code, tr, pid, val = struct.unpack("<H6xHxxIi", bytes(uc.mem_read(r(UC_ARM_REG_R1), 20)))
+                calls.append(("set", (code, tr, pid, val), ticks[0]))
+            else:                                       # page manager message / redraw check
+                uc.reg_write(UC_ARM_REG_R0, 0)
+            uc.reg_write(UC_ARM_REG_PC, uc.reg_read(UC_ARM_REG_LR))
+        for adr in (0x08122580, 0x081272CC, 0x08126524, 0x08126E8C, 0x0813AA90, 0x0813AA9E):
+            uc.hook_add(UC_HOOK_CODE, m4stub, begin=adr, end=adr)
+        uc.mem_write(0x300478B0, struct.pack("<i", rec_at))
+        uc.mem_write(STACK - 0x100, struct.pack("<H", 0x69))
+        e.call(Emu.symbol("loop_app_msg", "loop4.elf"), 0x30010000, STACK - 0x100)
+        n = 0
+        while ticks[0] < ticks_end:
+            n += 1
+            if n == take_flag_after:
+                uc.mem_write(0x30018010 + 0x743B, b"\1")   # the take runs once the recorder started
+            uc.mem_write(0x300478B0, struct.pack("<i", ticks[0]))
+            e.call(Emu.symbol("loop_tick", "loop4.elf"), 0x30010000, 0)
+            if errs[0] is not None and ticks[0] - errs[0] in (96, 120, 144):     # misses right after the take
+                uc.mem_write(ERRS, struct.pack("<I", struct.unpack("<I", bytes(uc.mem_read(ERRS, 4)))[0] + 2))
+            if ticks[0] == rec_at + 30000 // step * step:                       # a real error much later
+                uc.mem_write(ERRS, struct.pack("<I", struct.unpack("<I", bytes(uc.mem_read(ERRS, 4)))[0] + 1))
+            ticks[0] += step
+        rec_run.errs = struct.unpack("<I", bytes(uc.mem_read(ERRS, 4)))[0]
+        return calls
+    c = rec_run({(0, 0x162): 1, (0, 0x103): 1, (0, 0x104): 2, (3, 0x162): 1, (3, 0x103): 1, (5, 0x162): 1}, rec_at=1615)
+    check(len(c) == 3 and c[0][:2] == ("setrec", 0) and 0 <= c[0][2] - (3840 + 2 * 3840 + 240) < 24,
+          "REC with LOOP (BARS 2) at tick 1615: record off once at bar 1 + 2 bars + a 16th, no transport change: %s" % c)
+    check([x[1] for x in c[1:]] == [(0x6E, 0, 0x162, 0), (0x6E, 3, 0x162, 0)],
+          "then Rec Enable off for the loop tracks only (0, 3; not 5 without LOOP): %s" % c[1:])
+    check(rec_run.errs == 4, "stream errors right after the take are counted back, later ones stay: %d (want 3 + 1)"
+          % rec_run.errs)
+    c = rec_run({(0, 0x162): 1, (0, 0x103): 1, (0, 0x104): 1}, rec_at=3700)
+    check(len(c) == 2 and 0 <= c[0][2] - (7680 + 3840 + 240) < 24,
+          "REC less than a 16th before a bar line: the loop starts on the bar after: %s" % c)
+    c = rec_run({(0, 0x162): 1, (0, 0x103): 0, (0, 0x104): 2}, rec_at=1615)
+    check(c == [], "REC without LOOP: the stock recording, nothing switched off: %s" % c)
     # --- filter and fade
     def tone_run(freq, filt=0, fade=0, off_at=None, on_again_at=None, blocks=600, bpm=120):
         """track 0 looping a sine `freq` file (BARS 0: whole 30000-sample clip); returns output samples, emu"""
@@ -417,6 +504,74 @@ def main():
     e.process(0, [(0, P_LOOP, 0)])
     e.process(0, [])
     check(e.owners() == [None, None], "LOOP off with FADE and no voice playing frees the slot: %s" % e.owners())
+    # --- autostart of a freshly recorded clip
+    def auto_run(loop_on=True, blocks=6000, bpm=120.0, bars=2, cstart=1537, extra=240, after=100, fail_calls=0):
+        e = Emu()
+        e.init()
+        e.fail_calls = fail_calls
+        e.a3 = A3
+        e.uc.mem_write(A3, struct.pack("<I", TRANSPORT))
+        e.uc.mem_write(TRANSPORT + 0x18, struct.pack("<f", bpm))
+        ls = -(-cstart // 3840) * 3840
+        cend = ls + bars * 3840 + extra
+        e.uc.mem_write(PL2, b"\0" * 0x600)
+        e.uc.mem_write(PL2 + 0x18, struct.pack("<I", 0))
+        e.uc.mem_write(PL2 + 0x98, struct.pack("<IIIIqqq", 0, 0, 5, 0, cstart, cend, 0))
+        e.uc.mem_write(PL2 + 0x598, struct.pack("<i", 1))
+        e.uc.mem_write(PLAYER + 0x18, struct.pack("<I", 0))
+        if loop_on:
+            e.process(0, [(0, 0x103, 1), (0, 0x104, bars)])
+        spt = 48000 * 60 / (960 * bpm)
+        ticks = float(cend + after)
+        log = []
+        sym_pl = Emu.symbol("loop_player")
+        for b in range(blocks):
+            e.uc.mem_write(TRANSPORT + 0x30, struct.pack("<q", int(ticks)))
+            act = (e.uc.mem_read(PL2 + 0x20, 1)[0], e.uc.mem_read(PL2 + 0x58, 1)[0])
+            e.call(sym_pl, PL2, A3)                     # the player process first (autostart), then its voices
+            for voff, a0 in zip((0x20, 0x58), act):
+                if not a0 and e.uc.mem_read(PL2 + voff, 1)[0]:
+                    log.append(("start", ticks, struct.unpack("<q", bytes(e.uc.mem_read(PL2 + voff + 8, 8)))[0]))
+            for voff in (0x20, 0x58):                   # the stock order: voice A, then voice B
+                pv = PL2 + voff
+                before = struct.unpack("<q", bytes(e.uc.mem_read(pv + 8, 8)))[0]
+                active_before = e.uc.mem_read(pv, 1)[0]
+                uc = e.uc
+                uc.reg_write(UC_ARM_REG_SP, STACK)
+                uc.reg_write(UC_ARM_REG_LR, RET | 1)
+                for reg, val in ((UC_ARM_REG_R0, PL2), (UC_ARM_REG_R1, pv), (UC_ARM_REG_R2, BUS), (UC_ARM_REG_R3, A3)):
+                    uc.reg_write(reg, val)
+                saved = (VOICE,)
+                uc.emu_start(e.sym | 1, RET, count=40000)
+                after_pos = struct.unpack("<q", bytes(e.uc.mem_read(pv + 8, 8)))[0]
+                if active_before and after_pos < before:
+                    log.append(("jump", ticks, after_pos))
+                if not active_before and e.uc.mem_read(pv, 1)[0]:
+                    log.append(("start", ticks, after_pos))
+            ticks += N / spt
+        return e, log, ls, cend
+
+    e, log, ls, cend = auto_run(blocks=16000)
+    starts = [x for x in log if x[0] == "start"]
+    jumps = [x for x in log if x[0] == "jump"]
+    spt = 25.0
+    want_pos = round(((cend + 100 + 240 - ls) % 7680 + ls - 1537) * spt)   # phase a 16th after the take ends
+    check(len(starts) == 1 and abs(starts[0][2] - want_pos) <= 1 + 32 * 2,
+          "autostart: one start at file pos %s (want ~%d)" % ([x[2] for x in starts], want_pos))
+    grid = [ls + k * 7680 for k in range(1, 10)]
+    offs = [min(abs(j[1] - g) for g in grid) for j in jumps]
+    check(len(jumps) >= 2 and max(offs) < 3, "autostart: jumps on the bar grid (off by %s ticks), %d jumps"
+          % (["%.1f" % o for o in offs], len(jumps)))
+    check(e.vstarts == 1, "autostart only once per clip (%d starts)" % e.vstarts)
+    e3, log3, ls3, cend3 = auto_run(blocks=300, fail_calls=5)
+    st3 = [x for x in log3 if x[0] == "start"]
+    check(e3.vstarts == 1 and e3.vstart_calls == 6 and len(st3) == 1,
+          "autostart retries until the stock start starts the voice (%d calls, %d starts)" % (e3.vstart_calls, e3.vstarts))
+    e4, log4, _, _ = auto_run(blocks=7000, bpm=60.0, bars=1)
+    check(e4.vstarts == 1 and e4.vstart_calls == 1 and any(x[0] == "jump" for x in log4),
+          "autostart at 60 BPM: the coming clip waits as a delayed voice, then loops (%d calls)" % e4.vstart_calls)
+    e2, log2, _, _ = auto_run(loop_on=False, blocks=200)
+    check(e2.vstarts == 0, "no autostart without LOOP")
     print("PASS" if not fails else f"{fails} FAILED")
     sys.exit(1 if fails else 0)
 
