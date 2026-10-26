@@ -119,3 +119,27 @@ def stream_trace(cpu):
     elif n % 1500 == 0:
         print("WATCH pos asset %d: %d" % (asset, pos))
     _seen[key] = (pos, n + 1)
+
+
+def transport(cpu):
+    """At loop_voice / FUN_08057A00 entry: a3 -> transport object: float bpm +0x18, int64 position +0x30."""
+    n = _seen.get("tp", 0)
+    _seen["tp"] = n + 1
+    if n % 3000:
+        return
+    import struct
+    bus = cpu.Bus
+    t = bus.ReadDoubleWord(int(cpu.GetRegisterUnsafe(3).RawValue))
+    bpm = struct.unpack("<f", struct.pack("<I", bus.ReadDoubleWord(t + 0x18)))[0]
+    pos = bus.ReadDoubleWord(t + 0x30) | (bus.ReadDoubleWord(t + 0x34) << 32)
+    print("WATCH transport 0x%x bpm %.3f pos %d" % (t, bpm, pos))
+
+
+def loop_slot(cpu, label="slot"):
+    """Looper state (bluebox/src/loop_m7.c): header and slot 0 at SRAM4 0x3800F000."""
+    import struct
+    b = bytes(bytearray(cpu.Bus.ReadBytes(0x3800F000, 16 + 56)))
+    magic, mask, wraps, bars = struct.unpack_from("<IIII", b, 0)
+    v, asset, start, ln, passes, xf0, cend, lenq, acc = struct.unpack_from("<IIqqIIqqq", b, 16)
+    print("WATCH %s bars %d wraps %d | voice 0x%x asset %d start %d len %d (exact %.2f) passes %d cend %d"
+          % (label, bars, wraps, v, asset, start, ln, lenq / 65536.0, passes, cend))
