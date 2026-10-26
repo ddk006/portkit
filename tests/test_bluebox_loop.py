@@ -12,14 +12,18 @@ Crossfade (loop_read, replacing the cache read; the stock read FUN_0805B350 is m
     smooth across the jumps (second difference within a few times that of the sine), with and without audio past the
     loop end in the file;
   - reads outside the crossfade zone, before the first jump and of other assets pass through unchanged.
+Bars (transport modelled: a3 -> pointer -> object with float bpm +0x18, int64 ticks +0x30, advancing with the blocks):
+  - the loop starts on the first bar line after the clip's start and is exactly `bars` bars long;
+  - at a tempo where a bar is not a whole number of samples the jumps alternate and never drift;
+  - a clip too short for `bars` loops fewer bars, one shorter than a bar loops whole.
 """
 import os
 import struct
 import sys
 
-from unicorn import Uc, UC_ARCH_ARM, UC_MODE_THUMB, UC_MODE_MCLASS, UC_HOOK_CODE
+from unicorn import Uc, UC_ARCH_ARM, UC_MODE_THUMB, UC_HOOK_CODE
 from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3, UC_ARM_REG_SP, \
-    UC_ARM_REG_LR, UC_ARM_REG_PC
+    UC_ARM_REG_LR, UC_ARM_REG_PC, UC_ARM_REG_C1_C0_2, UC_ARM_REG_FPEXC, UC_CPU_ARM_MAX
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IMG = os.path.join(ROOT, "out", "bluebox", "loop", "BLUEEURO.BIN")
@@ -28,6 +32,7 @@ STACK, RAM = 0x20010000, 0x24000000
 PLAYER, VOICE, BUS = 0x24001000, 0x24001100, 0x24001200
 FW_VOICE, FW_FRAMES, FW_READ, RET = 0x08057A00, 0x0804D4C0, 0x0805B350, 0x24000000
 BUFL, BUFR, BUFT = 0x24002000, 0x24002400, 0x24002800
+TRANSPORT, A3 = 0x24003000, 0x24003100
 W = 2 * 3.141592653589793 * 440 / 48000
 N = 32
 VOICE_FMT = "<BBxxIq8xqq"                          # active, ending, asset, pos, delay, left
@@ -36,7 +41,11 @@ VOICE_FMT = "<BBxxIq8xqq"                          # active, ending, asset, pos,
 class Emu:
     def __init__(self):
         data = open(IMG, "rb").read()
-        self.uc = Uc(UC_ARCH_ARM, UC_MODE_THUMB | UC_MODE_MCLASS)
+        # as tests/bb_emu.py: an A-profile CPU in Thumb state with the FPU on runs the Thumb-2 / FPv5 code
+        self.uc = Uc(UC_ARCH_ARM, UC_MODE_THUMB)
+        self.uc.ctl_set_cpu_model(UC_CPU_ARM_MAX)
+        self.uc.reg_write(UC_ARM_REG_C1_C0_2, 0xF << 20)
+        self.uc.reg_write(UC_ARM_REG_FPEXC, 0x40000000)
         self.uc.mem_map(BASE, (len(data) + 0xFFFF) & ~0xFFFF)
         self.uc.mem_write(BASE, data)
         self.uc.mem_map(SRAM4, 0x10000)
@@ -49,6 +58,7 @@ class Emu:
         self.sym = self.symbol("loop_voice")
         self.sym_read = self.symbol("loop_read")
         self.file_len = 1 << 40
+        self.a3 = 0
         self.reads = []
 
     @staticmethod
@@ -119,7 +129,7 @@ class Emu:
         uc = self.uc
         uc.reg_write(UC_ARM_REG_SP, STACK)
         uc.reg_write(UC_ARM_REG_LR, RET | 1)
-        for r, v in ((UC_ARM_REG_R0, PLAYER), (UC_ARM_REG_R1, VOICE), (UC_ARM_REG_R2, BUS), (UC_ARM_REG_R3, 0)):
+        for r, v in ((UC_ARM_REG_R0, PLAYER), (UC_ARM_REG_R1, VOICE), (UC_ARM_REG_R2, BUS), (UC_ARM_REG_R3, self.a3)):
             uc.reg_write(r, v)
         uc.emu_start(self.sym | 1, RET, count=20000)
 
@@ -202,6 +212,42 @@ def main():
     check(all(abs(v - 0.5 * math.sin(W * (5010 + i))) < 1e-5 for i, v in enumerate(vals)), "other assets pass through")
     ok, vals = e.read(5000 + 1000, N)                  # same asset outside the zone: pass through
     check(all(abs(v - 0.5 * math.sin(W * (6000 + i))) < 1e-5 for i, v in enumerate(vals)), "reads outside the zone pass through")
+    def bars_run(bpm, bars, t0, clip, passes):
+        """voice at file pos 0 starting at tick t0; returns (jumps [(size, landing)], loop start expected)"""
+        e = Emu()
+        e.a3 = A3
+        e.uc.mem_write(A3, struct.pack("<I", TRANSPORT))
+        e.uc.mem_write(STATE, struct.pack("<IIII", 0x504F4F4C, 0xFFF, 0, bars))
+        e.uc.mem_write(PLAYER + 0x18, struct.pack("<I", 0))
+        e.voice(active=1, ending=0, asset=7, pos=0, delay=0, left=clip)
+        spt = 48000 * 60 / (960 * bpm)
+        ticks, jumps = float(t0), []
+        while len(jumps) < passes and e.voice()["active"]:
+            e.uc.mem_write(TRANSPORT + 0x18, struct.pack("<f", bpm))
+            e.uc.mem_write(TRANSPORT + 0x30, struct.pack("<q", int(ticks)))
+            p = e.voice()["pos"]
+            e.block()
+            q = e.voice()["pos"]
+            if q < p:
+                jumps.append((p + N - q, q))
+            ticks += N / spt
+            if ticks > t0 + 200 * 3840:
+                break
+        bar = -(-t0 // 3840) * 3840
+        return jumps, round((bar - t0) * spt), e.voice()["active"]
+
+    jumps, ls, _ = bars_run(120, 2, 1251, 6 * 96000, 3)
+    check(len(jumps) == 3 and all(sz == 192000 for sz, _ in jumps), "120 BPM, 2 bars: jumps %s" % [j[0] for j in jumps])
+    check(all(ls <= at < ls + N for _, at in jumps), "120 BPM: lands on the bar line at sample %d: %s" % (ls, [j[1] for j in jumps]))
+    jumps, ls, _ = bars_run(133, 3, 0, 4 * 259850, 6)
+    exact = 3 * 3840 * 48000 * 60 / (960 * 133)
+    total = sum(sz for sz, _ in jumps)
+    check(len(jumps) == 6 and abs(total - 6 * exact) < 1, "133 BPM, 3 bars: jumps %s, sum %d vs %.2f"
+          % (sorted(set(j[0] for j in jumps)), total, 6 * exact))
+    jumps, ls, _ = bars_run(120, 4, 0, int(1.5 * 96000), 2)
+    check(len(jumps) == 2 and all(sz == 96000 for sz, _ in jumps), "clip of 1.5 bars, 4 asked: loops 1 bar (%s)" % [j[0] for j in jumps])
+    jumps, ls, _ = bars_run(120, 4, 0, 50000, 2)
+    check(len(jumps) == 2 and all(sz == 50000 for sz, _ in jumps), "clip shorter than a bar: loops whole (%s)" % [j[0] for j in jumps])
     print("PASS" if not fails else f"{fails} FAILED")
     sys.exit(1 if fails else 0)
 

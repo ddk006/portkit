@@ -8,10 +8,17 @@
  * When the samples left drop below one, the stock code fades the voice out and starts the player's next clip.
  *
  * loop_voice replaces the three calls of FUN_08057A00 (0x08057D1E, 0x08057EF8, 0x08057F06). For a looping track it
- * remembers where the clip started (position and length, at the first block it sees of that voice), and when this
- * block would end the clip it adds one clip length to the samples left first; after the block it moves the read
- * position back by one length. The invariant  left = len - (pos - start)  holds across the jump, so the loop keeps
- * its length exactly (no drift).
+ * fixes the loop region at the first block it sees of a voice:
+ *   - bars = 0: the whole clip;
+ *   - bars = 1..16: from the first bar line at or after the point where the clip plays on the timeline, `bars` bars
+ *     long (4/4: 3840 ticks a bar, 960 PPQ), in samples at the current tempo; fewer bars if the clip is too short
+ *     (whole clip if not even one fits with XF samples to spare).
+ * The fourth argument a3 points to the transport pointer (as passed on to the voice start 0x0805779C): transport
+ * +0x18 float tempo (BPM), +0x30 int64 position in ticks; samples = ticks / 960 / bpm * 60 * 48000 (0x0805AB80).
+ * When a block would reach the loop end, the samples left get one loop length added first (so the stock code doesn't
+ * end the clip); after the block the read position moves back by that length. left = clip end - pos holds throughout.
+ * A bar is rarely a whole number of samples: the jump lengths come from a 48.16 fixed-point accumulator, so over many
+ * passes the loop stays on the transport's bar grid (no drift). Tempo changes while looping are not followed yet.
  *
  * The jump happens at a block boundary (32 frames): the last block of a pass reads up to 31 samples past the clip end,
  * the next pass starts at the matching offset. The click there is removed by a crossfade in the cache read:
@@ -52,21 +59,27 @@ struct voice {
 struct loop_slot {
     struct voice *v;              /* 0 = free */
     uint32_t asset;
-    int64_t start, len;
+    int64_t start, len;           /* loop region in the file; len = the next (or last) jump */
     uint32_t passes;              /* jumps done on this clip: the crossfade starts with the first */
     uint32_t xf0;                 /* where the last jump landed, samples after start: the crossfade starts there */
+    int64_t cend;                 /* clip end in the file */
+    int64_t lenq, acc;            /* loop length and jump accumulator, 48.16 fixed point */
 };
 struct loop_state {
     uint32_t magic;
     uint32_t mask;                /* bit n: track (player queue id) n loops */
     uint32_t wraps;               /* jumps done, for tests */
-    uint32_t _p;
+    uint32_t bars;                /* loop length in bars, 0 = whole clip (set before a clip starts) */
     struct loop_slot slot[SLOTS];
 };
 #define LS ((volatile struct loop_state *)0x3800F000u)
 #define LS_MAGIC 0x504f4f4cu      /* "LOOP" */
 #define LOOP_ALL 0x0fffu
 #define P_QUEUE 0x18              /* the player node's queue id = its channel */
+#define T_BPM 0x18                /* transport: float tempo */
+#define T_POS 0x30                /* transport: int64 position, ticks */
+#define BAR_TICKS 3840            /* 4/4 at 960 PPQ */
+#define MAX_BARS 16
 
 static struct loop_state *state(void)
 {
@@ -76,6 +89,7 @@ static struct loop_state *state(void)
             s->slot[i].v = 0;
         s->mask = LOOP_ALL;
         s->wraps = 0;
+        s->bars = 0;
         s->magic = LS_MAGIC;
     }
     return s;
@@ -98,6 +112,42 @@ static struct loop_slot *find(struct loop_state *s, struct voice *v, int make)
     return make ? free_ : 0;
 }
 
+/* Fix the loop region of a voice seen for the first time (or a new clip on it). */
+static void region(struct loop_state *s, struct loop_slot *sl, struct voice *v, uint32_t a3)
+{
+    sl->asset = v->asset;
+    sl->passes = 0;
+    sl->acc = 0;
+    sl->cend = v->pos + v->left;
+    sl->start = v->pos;                                  /* bars = 0 / fallback: the whole clip */
+    sl->lenq = v->left << 16;
+    unsigned bars = s->bars > MAX_BARS ? MAX_BARS : s->bars;
+    uint8_t *t = a3 ? *(uint8_t **)a3 : 0;
+    float bpm = t ? *(float *)(t + T_BPM) : 0.f;
+    if (bars && bpm > 1.f) {
+        /* 32-bit is plenty here (2^31 ticks are > 300 h at 120 BPM, 2^31 samples 12 h) and keeps the conversions on
+         * the FPU (int64 <-> double would need libgcc) */
+        double spt = 48000.0 * 60.0 / (960.0 * bpm);    /* samples per tick */
+        int32_t pos = (int32_t)v->pos, cend = (int32_t)sl->cend;
+        double t0 = (double)(int32_t)*(int64_t *)(t + T_POS) + (double)(int32_t)v->delay / spt;  /* tick of v->pos */
+        int32_t bar = ((int32_t)t0 + BAR_TICKS - 1) / BAR_TICKS * BAR_TICKS;
+        if ((double)bar < t0)
+            bar += BAR_TICKS;
+        int32_t ls = pos + (int32_t)(((double)bar - t0) * spt + 0.5);
+        double barlen = BAR_TICKS * spt;
+        while (bars && (double)ls + bars * barlen + XF > (double)cend)
+            bars--;                                      /* fewer bars if the clip is too short */
+        if (bars) {
+            double q = bars * barlen * 65536.0 + 0.5;    /* < 2^47: split so each part converts in 32 bits */
+            uint32_t hi = (uint32_t)(q / 4294967296.0);
+            uint32_t lo = (uint32_t)(q - (double)hi * 4294967296.0);
+            sl->start = ls;
+            sl->lenq = ((int64_t)hi << 32) | lo;
+        }
+    }
+    sl->len = sl->lenq >> 16;
+}
+
 void loop_voice(void *player, void *voice, void *bus, uint32_t a3)
 {
     struct loop_state *s = state();
@@ -116,23 +166,21 @@ void loop_voice(void *player, void *voice, void *bus, uint32_t a3)
         fw_voice(player, voice, bus, a3);
         return;
     }
-    /* a new clip on this voice (or the first block we see): remember start and length */
-    if (sl->len <= 0 || sl->asset != v->asset || v->pos < sl->start || v->pos - sl->start > sl->len) {
-        sl->asset = v->asset;
-        sl->start = v->pos;
-        sl->len = v->left;
-        sl->passes = 0;
-    }
+    if (sl->len <= 0 || sl->asset != v->asset || v->pos + v->left != sl->cend)
+        region(s, sl, v, a3);                            /* new clip on this voice */
     int64_t n = fw_frames(bus);
-    int wrap = sl->len > n && v->left <= n;
+    int wrap = sl->len > n && v->pos + n >= sl->start + sl->len;
     if (wrap)
         v->left += sl->len;                              /* keep the stock code from ending the clip */
     fw_voice(player, voice, bus, a3);
     if (wrap && v->active) {
-        v->pos -= sl->len;
+        v->pos -= sl->len;                               /* left (+len before the block) = clip end - pos again */
         sl->xf0 = (uint32_t)(v->pos - sl->start);
         sl->passes++;
         s->wraps++;
+        /* next jump: whole samples from the accumulator, the fractions carried over */
+        sl->acc += sl->lenq - ((int64_t)sl->len << 16);
+        sl->len = (sl->lenq + sl->acc) >> 16;
     }
 }
 

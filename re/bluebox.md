@@ -138,6 +138,16 @@ aufnehmen und von SD abspielen, Ausblenden mit Filter. Projektwechsel (= "Preset
   Stimme den ganzen Block still). Unicorn 13/13. Renode (Sinus-Clip mit 1 s Audio hinter dem Clip-Ende): kein
   Knackser mehr (max. 2,8x der Sinuskrümmung, vorher 185x/480x), Pegel wie stock (0,310 beide). Offen: ein früherer
   Lauf mit anderem Kartenabbild zeigte 0,62 (Ursache nicht geklärt).
+- **Taktlänge (2026-10-26, Build 1.5.1L3):** Transport = `*a3` (viertes Argument der Stimmen-Funktion, wie an
+  0x0805779C weitergereicht): +0x18 float Tempo, +0x30 int64 Position in Ticks (emu: 120.000, +1920 Ticks/s).
+  Umrechnung 0x0805AB80: Samples = Ticks / 960 / BPM x 60 x 48000 (Konstanten 960.0 / 60.0 bei 0x0805ABF8).
+  Clip-Eintrag (r2 der Stimmen-Start-Funktion): +0x08 Asset, +0x10 int64 Start (Ticks), +0x20 int64 Versatz in der
+  Datei (Ticks). Loop: erster Taktstrich (3840 Ticks, 4/4 angenommen) ab der Stelle, an der der Clip auf der
+  Zeitleiste spielt, `bars` Takte lang; Sprunglängen aus einem 48.16-Festkomma-Akkumulator. Unicorn 18/18
+  (120 BPM 2 Takte: Sprünge 192000, Landung im Block des Taktstrichs 64725; 133 BPM 3 Takte: Sprünge 259849/259850,
+  Summe nach 6 Durchläufen 1559097 bei exakt 1559097,74). Renode (Clip 1251..8931 Ticks, bars = 1 per SRAM4):
+  120 BPM Start 64725, Länge 96000, 3 Durchläufe in 8 s; 133 BPM Start 58399 (erwartet 58398, Rundung der Tickposition),
+  Länge 86617 (exakt 86616,54), 3 Durchläufe. Offen: Taktart (nur 4/4), Tempowechsel während des Loops.
 - RAM-Rechnung: frei ~6,4 MB (1,5 + 4,9). 24 Bit mono 3 MB je Slot = 21,8 s (16 Takte nur ab ~176 BPM),
   stereo 10,9 s. Daher SD.
 - Einhängepunkt: noch offen; Kandidaten sind die Kanalkette (Bus 0..11 vor dem Mixer `b988`) oder der Mixer selbst.
