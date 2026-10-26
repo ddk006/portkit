@@ -20,12 +20,16 @@ OUT = os.path.join(ROOT, "out", "bluebox")
 STOCK = os.path.join(ROOT, "firmware", "BLUEEURO.BIN")
 STOCK_SHA256 = "fcb04565e2fd5bc15c0b2d0dc913dc99dc74732611e8cef0d7e8e4bb4af7402b"
 BASE = 0x08040000                       # the file is contiguous flash from here (re/bluebox.md)
-VERSION = (0x08149640, b"1.5.1\0\0\0", b"1.5.1L3\0")
+VERSION = (0x08149640, b"1.5.1\0\0\0", b"1.5.1L4\0")
 
 # M7 cave: inside the zero-filled gap 0x0808AC00..0x08090000, below every cave bluelex uses (0x08090000..)
-CAVE7 = (0x0808C000, 0x4000)
-CFLAGS = ["-mcpu=cortex-m7", "-mthumb", "-mfloat-abi=hard", "-mfpu=fpv5-d16", "-O2", "-ffreestanding", "-nostdlib",
-          "-fno-builtin", "-Wall", "-Wextra", "-Werror", "-Wl,-e,0"]
+CAVE7 = (0x0808C000, 0x2000)
+# M4 cave: the rest of that gap (the M4 executes from bank 1, as bluelex's M4 caves do)
+CAVE4 = (0x0808E000, 0x2000)
+COMMON = ["-mthumb", "-mfloat-abi=hard", "-O2", "-ffreestanding", "-nostdlib", "-fno-builtin", "-Wall", "-Wextra",
+          "-Werror", "-Wl,-e,0"]
+M7 = ["-mcpu=cortex-m7", "-mfpu=fpv5-d16"]
+M4 = ["-mcpu=cortex-m4", "-mfpu=fpv4-sp-d16"]
 
 
 def bl(at, target):
@@ -38,7 +42,7 @@ def bl(at, target):
                        0xD000 | (j1 << 13) | (j2 << 11) | ((off >> 1) & 0x7FF))
 
 
-def compile_cave(name, sources, origin, length):
+def compile_cave(name, sources, origin, length, cpu=M7):
     os.makedirs(OUT, exist_ok=True)
     ld = os.path.join(OUT, name + ".ld")
     open(ld, "w").write(
@@ -46,7 +50,7 @@ def compile_cave(name, sources, origin, length):
         "SECTIONS {\n  .cave : { *(.text .text.* .rodata .rodata.*) } > CAVE\n"
         "  /DISCARD/ : { *(.data .data.* .bss .bss.* COMMON .ARM.exidx* .comment) }\n}\n")
     elf = os.path.join(OUT, name + ".elf")
-    subprocess.run(["arm-none-eabi-gcc", *CFLAGS, "-T", ld, "-o", elf, *[os.path.join(SRC, s) for s in sources]],
+    subprocess.run(["arm-none-eabi-gcc", *cpu, *COMMON, "-T", ld, "-o", elf, *[os.path.join(SRC, s) for s in sources]],
                    check=True)
     binf = os.path.join(OUT, name + ".bin")
     subprocess.run(["arm-none-eabi-objcopy", "-O", "binary", "-j", ".cave", elf, binf], check=True)
@@ -59,14 +63,24 @@ def compile_cave(name, sources, origin, length):
 
 def feature_loop():
     code, s = compile_cave("loop7", ["loop_m7.c"], *CAVE7)
+    code4, s4 = compile_cave("loop4", ["loop_m4.c"], *CAVE4, cpu=M4)
     sites = (0x08057D1E, 0x08057EF8, 0x08057F06)             # the track player's calls of FUN_08057A00
-    patches = [(CAVE7[0], bytes(len(code)), code, "loop7 cave")]
+    patches = [(CAVE7[0], bytes(len(code)), code, "loop7 cave"), (CAVE4[0], bytes(len(code4)), code4, "loop4 cave")]
     patches += [(a, bl(a, 0x08057A00), bl(a, s["loop_voice"]), "voice -> loop_voice") for a in sites]
+    # track player node vtable 0x0806BF74, slot 3 (process 0x080574EC) -> loop_process (LOOP / BARS per track)
+    patches.append((0x0806BF80, struct.pack("<I", 0x080574ED), struct.pack("<I", s["loop_process"] | 1),
+                    "player process ptr = loop_process"))
+    # M4: parameter table, last definition (id 0x117) -> loop_defs; channel set, add of id 0x2A -> loop_set_add
+    patches.append((0x0813714A, bl(0x0813714A, 0x08135E08), bl(0x0813714A, s4["loop_defs"]), "def -> loop_defs"))
+    patches.append((0x0812087C, bl(0x0812087C, 0x081205E2), bl(0x0812087C, s4["loop_set_add"]),
+                    "set add -> loop_set_add"))
     # stream cache vtable 0x08076BD4, slot 2 (read 0x0805B350) -> loop_read (crossfade at the loop point)
     patches.append((0x08076BDC, struct.pack("<I", 0x0805B351), struct.pack("<I", s["loop_read"] | 1),
                     "cache read ptr = loop_read"))
-    targets = {s["loop_voice"] & ~1: "loop_voice"}
-    return patches, targets, {"loop7": len(code), "loop7_free": CAVE7[1] - len(code)}
+    targets = {s["loop_voice"] & ~1: "loop_voice", s4["loop_defs"] & ~1: "loop_defs",
+               s4["loop_set_add"] & ~1: "loop_set_add"}
+    return patches, targets, {"loop7": len(code), "loop7_free": CAVE7[1] - len(code), "loop4": len(code4),
+                              "loop4_free": CAVE4[1] - len(code4)}
 
 
 FEATURES = {"loop": feature_loop}
@@ -103,7 +117,7 @@ def main(args):
             tgt = next(t for t, n in targets.items() if n == what.split(" -> ")[1])
             assert new == bl(addr, tgt), f"{what}: BL at {addr:#x} does not reach {tgt:#x}"
         if " ptr = " in what:
-            assert struct.unpack("<I", new)[0] & ~1 >= CAVE7[0], f"{what}: pointer outside the cave"
+            assert CAVE7[0] <= struct.unpack("<I", new)[0] & ~1 < CAVE7[0] + CAVE7[1], f"{what}: pointer outside the cave"
     if null:
         assert bytes(data) == stock, "null repack differs from stock"
         print("null repack: identical to stock")

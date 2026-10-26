@@ -1,5 +1,6 @@
 # Hooks for the bluebox simulation (IronPython 2.7, loaded by sim/bluebox_boot.resc). The image is never changed.
 import clr
+import System
 from Antmicro.Renode.Peripherals.CPU import RegisterValue
 
 CM4_CPUID = 0x410FC241
@@ -143,3 +144,15 @@ def loop_slot(cpu, label="slot"):
     v, asset, start, ln, passes, xf0, cend, lenq, acc = struct.unpack_from("<IIqqIIqqq", b, 16)
     print("WATCH %s bars %d wraps %d | voice 0x%x asset %d start %d len %d (exact %.2f) passes %d cend %d"
           % (label, bars, wraps, v, asset, start, ln, lenq / 65536.0, passes, cend))
+
+
+def inject(machine, dest, pid, value):
+    """Put a parameter event (type 0x39) into the M4 -> M7 mailbox queue (0x30040000, 256 x 24 bytes, read index
+    +0x1800, write index +0x1804), as the M4 does when a parameter changes."""
+    import struct
+    bus = machine.SystemBus
+    w = bus.ReadDoubleWord(0x30041804)
+    entry = struct.pack("<B7xIHxxiI", 0x39, dest, pid, value, 0)
+    bus.WriteBytes(System.Array[System.Byte](bytearray(entry)), 0x30040000 + 24 * (w & 0xFF))
+    bus.WriteDoubleWord(0x30041804, w + 1)
+    print("WATCH inject dest %d id 0x%x value %d (write index %d)" % (dest, pid, value, w))

@@ -148,6 +148,16 @@ aufnehmen und von SD abspielen, Ausblenden mit Filter. Projektwechsel (= "Preset
   Summe nach 6 Durchläufen 1559097 bei exakt 1559097,74). Renode (Clip 1251..8931 Ticks, bars = 1 per SRAM4):
   120 BPM Start 64725, Länge 96000, 3 Durchläufe in 8 s; 133 BPM Start 58399 (erwartet 58398, Rundung der Tickposition),
   Länge 86617 (exakt 86616,54), 3 Durchläufe. Offen: Taktart (nur 4/4), Tempowechsel während des Loops.
+- **LOOP/BARS pro Spur (2026-10-26, Build 1.5.1L4):** Kanal-Panel = Seitenobjekt `FUN_08133470` mit festen Widgets
+  (8 Regler à 0x3D0 ab +0xC398, 5 Buttons à 0x1D4 ab +0xE298; Label + Parameter-Id, z. B. REC 0x162, MUTE 0x160);
+  Mixerseite mit Reitern `FUN_0812F398` (Listen 0x0814E280 / 0x0814E290). Kanal-Parametermenge = `FUN_0812060C`
+  Fall 1 (u. a. 0x004, 0x003, 0x063, 0xDA, 0xDB, 0x15D..0x163, 0x16D, EQ 0x119..0x12F, Ducker 0x1F..0x2A).
+  Freie Ids (in keiner Tabelle, nirgends verglichen oder geladen): 0x102..0x105, 0x107..0x10A; belegt: 0x103 LOOP
+  (Toggle, `chloop`), 0x104 BARS (1..16, `chloopbars`, Standard 4). Events: Postfach-Eintrag +0x08 = Ziel-Queue
+  (= Spur), +0x0C Id, +0x10 Wert; der Player-Prozess prüft +8 gegen seine Queue-Id (+0x18).
+  Unicorn 24/24. Renode: M4 definiert beide Parameter; LOOP = 1 / BARS = 1 per Postfach für Spur 0 -> Loop ab 64725,
+  96000 Samples; LOOP = 0 -> Signal endet sofort (6,55 s statt Loop bis 9 s). Der M4 schickt die Standardwerte der
+  neuen Kanal-Parameter selbst an den M7 (BARS = 4 für Spur 1 gesehen). Noch keine Widgets im Panel.
 - RAM-Rechnung: frei ~6,4 MB (1,5 + 4,9). 24 Bit mono 3 MB je Slot = 21,8 s (16 Takte nur ab ~176 BPM),
   stereo 10,9 s. Daher SD.
 - Einhängepunkt: noch offen; Kandidaten sind die Kanalkette (Bus 0..11 vor dem Mixer `b988`) oder der Mixer selbst.

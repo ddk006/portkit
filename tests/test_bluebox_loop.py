@@ -16,6 +16,11 @@ Bars (transport modelled: a3 -> pointer -> object with float bpm +0x18, int64 ti
   - the loop starts on the first bar line after the clip's start and is exactly `bars` bars long;
   - at a tempo where a bar is not a whole number of samples the jumps alternate and never drift;
   - a clip too short for `bars` loops fewer bars, one shorter than a bar loops whole.
+Tracks and slots (loop_process with the stock queue / event / player modelled; M4 loop_defs / loop_set_add):
+  - LOOP takes one of two slots in switch-on order; a third track waits and gets the next free slot;
+  - BARS is kept per track and clamped to 1..16; events for another queue are ignored; the stock process always runs;
+  - LOOP off ends a looping clip within a block;
+  - the M4 hooks call the stock function, then define / add LOOP and BARS.
 """
 import os
 import struct
@@ -33,6 +38,9 @@ PLAYER, VOICE, BUS = 0x24001000, 0x24001100, 0x24001200
 FW_VOICE, FW_FRAMES, FW_READ, RET = 0x08057A00, 0x0804D4C0, 0x0805B350, 0x24000000
 BUFL, BUFR, BUFT = 0x24002000, 0x24002400, 0x24002800
 TRANSPORT, A3 = 0x24003000, 0x24003100
+FW_QUEUE, FW_NEXT_EV, FW_PLAYER, QUEUE = 0x08053C8C, 0x0804E938, 0x080574EC, 0x24004000
+FW_DEF, FW_ADD = 0x08135E08, 0x081205E2
+OWNER, CHBARS, WANT = STATE + 0x710, STATE + 0x712, STATE + 0x71E
 W = 2 * 3.141592653589793 * 440 / 48000
 N = 32
 VOICE_FMT = "<BBxxIq8xqq"                          # active, ending, asset, pos, delay, left
@@ -57,16 +65,60 @@ class Emu:
         self.uc.hook_add(UC_HOOK_CODE, self.read_stub, begin=FW_READ, end=FW_READ)
         self.sym = self.symbol("loop_voice")
         self.sym_read = self.symbol("loop_read")
+        self.sym_proc = self.symbol("loop_process")
+        self.events, self.player_calls, self.m4_calls = [], 0, []
+        for a in (FW_QUEUE, FW_NEXT_EV, FW_PLAYER, FW_DEF, FW_ADD):
+            self.uc.hook_add(UC_HOOK_CODE, self.api_stub, begin=a, end=a)
         self.file_len = 1 << 40
         self.a3 = 0
         self.reads = []
 
     @staticmethod
-    def symbol(name):
+    def symbol(name, elf="loop7.elf"):
         import subprocess
-        out = subprocess.run(["arm-none-eabi-nm", os.path.join(ROOT, "out", "bluebox", "loop7.elf")],
+        out = subprocess.run(["arm-none-eabi-nm", os.path.join(ROOT, "out", "bluebox", elf)],
                              capture_output=True, text=True, check=True).stdout
         return next(int(l.split()[0], 16) for l in out.splitlines() if l.split()[-1] == name)
+
+    def api_stub(self, uc, addr, size, _):
+        r = lambda k: uc.reg_read(k)
+        if addr == FW_QUEUE:
+            uc.reg_write(UC_ARM_REG_R0, QUEUE)
+        elif addr == FW_NEXT_EV:                        # (queue, index, event*) -> 1 and the event, or 0
+            i, dst = r(UC_ARM_REG_R1), r(UC_ARM_REG_R2)
+            if i < len(self.events):
+                dest, pid, val = self.events[i]
+                uc.mem_write(dst, struct.pack("<B7xIHxxiI", 0x39, dest, pid, val, 0))
+                uc.reg_write(UC_ARM_REG_R0, 1)
+            else:
+                uc.reg_write(UC_ARM_REG_R0, 0)
+        elif addr == FW_PLAYER:
+            self.player_calls += 1
+            uc.reg_write(UC_ARM_REG_R0, 77)
+        else:                                           # M4 def / add: record (id, value or type)
+            self.m4_calls.append(("def" if addr == FW_DEF else "add", r(UC_ARM_REG_R1), r(UC_ARM_REG_R2)))
+        uc.reg_write(UC_ARM_REG_PC, uc.reg_read(UC_ARM_REG_LR))
+
+    def call(self, sym, *args, stack=b""):
+        uc = self.uc
+        sp = STACK - 64
+        uc.mem_write(sp, stack + b"\0" * (64 - len(stack)))
+        uc.reg_write(UC_ARM_REG_SP, sp)
+        uc.reg_write(UC_ARM_REG_LR, RET | 1)
+        for reg, v in zip((UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3), args):
+            uc.reg_write(reg, v)
+        uc.emu_start(sym | 1, RET, count=200000)
+        return uc.reg_read(UC_ARM_REG_R0)
+
+    def process(self, track, events):
+        """loop_process for the player node of `track` with these (dest, id, value) events in its queue"""
+        self.uc.mem_write(PLAYER + 0x18, struct.pack("<I", track))
+        self.events = events
+        return self.call(self.sym_proc, PLAYER, 0)
+
+    def owners(self):
+        o = bytes(self.uc.mem_read(OWNER, 2))
+        return [b - 1 if b else None for b in o]
 
     def voice(self, **kw):
         cur = dict(zip(("active", "ending", "asset", "pos", "delay", "left"),
@@ -140,6 +192,7 @@ class Emu:
 
 def play(track, length, blocks, start=5000, ending=0, mask=None):
     e = Emu()
+    e.uc.mem_write(STATE, struct.pack("<II", 0x504F4F4C, 0xFFF))      # debug mask: every track loops
     e.uc.mem_write(PLAYER + 0x18, struct.pack("<I", track))
     e.voice(active=1, ending=ending, asset=7, pos=start, delay=0, left=length)
     e.block()                                         # first block initialises the state (mask = all)
@@ -183,6 +236,7 @@ def main():
     def render(file_extra, L=3000, B=400, start=5000):
         """the voice's view: per block, its read position before loop_voice, then the read there"""
         e = Emu()
+        e.uc.mem_write(STATE, struct.pack("<II", 0x504F4F4C, 0xFFF))
         e.file_len = start + L + file_extra
         e.uc.mem_write(PLAYER + 0x18, struct.pack("<I", 0))
         e.voice(active=1, ending=0, asset=7, pos=start, delay=0, left=L)
@@ -248,6 +302,47 @@ def main():
     check(len(jumps) == 2 and all(sz == 96000 for sz, _ in jumps), "clip of 1.5 bars, 4 asked: loops 1 bar (%s)" % [j[0] for j in jumps])
     jumps, ls, _ = bars_run(120, 4, 0, 50000, 2)
     check(len(jumps) == 2 and all(sz == 50000 for sz, _ in jumps), "clip shorter than a bar: loops whole (%s)" % [j[0] for j in jumps])
+    # --- tracks and slots
+    e = Emu()
+    e.uc.mem_write(STATE, struct.pack("<IIII", 0x504F4F4C, 0, 0, 0))
+    P_LOOP, P_BARS = 0x103, 0x104
+    ret = e.process(0, [(0, P_LOOP, 1)])
+    e.process(1, [(1, P_LOOP, 1)])
+    e.process(2, [(2, P_LOOP, 1)])
+    check(e.owners() == [0, 1], "two slots in switch-on order: %s" % e.owners())
+    check(ret == 77 and e.player_calls == 3, "stock player process runs and its result is returned")
+    e.process(0, [(0, P_LOOP, 0)])
+    check(e.owners() == [2, 1], "track 0 off: waiting track 2 gets its slot: %s" % e.owners())
+    e.process(1, [(1, P_BARS, 8), (5, P_BARS, 3)])
+    e.process(3, [(3, P_BARS, 99)])
+    e.process(4, [(4, P_BARS, 0)])
+    cb = bytes(e.uc.mem_read(CHBARS, 12))
+    check(cb[1] == 8 and cb[3] == 16 and cb[4] == 1 and cb[5] == 0, "BARS per track, clamped, other queues ignored: %s" % list(cb[:6]))
+
+    # LOOP off ends a looping clip
+    e = Emu()
+    e.uc.mem_write(STATE, struct.pack("<IIII", 0x504F4F4C, 0, 0, 0))
+    e.process(0, [(0, P_LOOP, 1)])
+    e.uc.mem_write(PLAYER + 0x18, struct.pack("<I", 0))
+    e.voice(active=1, ending=0, asset=7, pos=5000, delay=0, left=1000)
+    for _ in range(100):
+        e.block()
+    looped = e.state()[2] > 0 and e.voice()["active"]
+    e.process(0, [(0, P_LOOP, 0)])
+    e.uc.mem_write(PLAYER + 0x18, struct.pack("<I", 0))
+    for _ in range(2):
+        if e.voice()["active"]:
+            e.block()
+    check(looped and not e.voice()["active"], "LOOP off ends the looping clip within a block")
+
+    # M4 hooks
+    m4 = Emu()
+    for name, args, stack in (("loop_defs", (0x30000000, 0x117, 4, 0x08149000), struct.pack("<iiI", 0, 1, 0x08149010)),
+                              ("loop_set_add", (0x30000100, 0x2A, 500), b"")):
+        m4.call(Emu.symbol(name, "loop4.elf"), *args, stack=stack)
+    calls = [(k, hex(i)) for k, i, _ in m4.m4_calls]
+    check(calls == [("def", "0x117"), ("def", "0x103"), ("def", "0x104"), ("add", "0x2a"), ("add", "0x103"),
+                    ("add", "0x104")], "M4: stock call first, then LOOP and BARS: %s" % calls)
     print("PASS" if not fails else f"{fails} FAILED")
     sys.exit(1 if fails else 0)
 
