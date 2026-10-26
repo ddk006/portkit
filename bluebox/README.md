@@ -9,11 +9,11 @@ python3 bluebox/build.py loop                         # -> out/bluebox/loop/BLUE
 ```
 
 The build checks every patch site against its stock bytes, that every changed byte lies in a registered range and
-that every BL lands on its symbol. The version string on the settings page marks the build (`1.5.1L5`).
+that every BL lands on its symbol. The version string on the settings page marks the build (`1.5.1L6`).
 
 | Feature | Where | What | Status |
 |---|---|---|---|
-| `loop` (prototype) | track playback | a clip on a track with LOOP on repeats BARS bars from the bar line (2 slots), 256-sample equal-power crossfade at the loop point; M7 cave 0x0808C000 (8 KB), M4 cave 0x0808E000 (8 KB); BL at 0x08057D1E / 0x08057EF8 / 0x08057F06 -> `loop_voice`, stream cache vtable 0x08076BDC -> `loop_read`, player vtable 0x0806BF80 -> `loop_process`, M4 BL 0x0813714A -> `loop_defs`, 0x0812087C -> `loop_set_add` | Unicorn: 30/30; Renode: loops without drift, no click (max curvature 2.8x a pure sine, was 185-480x), level as stock, 1 bar at 120 / 133 BPM starts on the bar line with the right length; not on hardware |
+| `loop` (prototype) | track playback | a clip on a track with LOOP on repeats BARS bars from the bar line (2 slots), 256-sample equal-power crossfade at the loop point; M7 cave 0x0808C000 (8 KB), M4 cave 0x0808E000 (8 KB); BL at 0x08057D1E / 0x08057EF8 / 0x08057F06 -> `loop_voice`, stream cache vtable 0x08076BDC -> `loop_read`, player vtable 0x0806BF80 -> `loop_process`, M4 BL 0x0813714A -> `loop_defs`, 0x0812087C -> `loop_set_add` | Unicorn: 31/31; Renode: loops without drift, no click (max curvature 2.8x a pure sine, was 185-480x), level as stock, 1 bar at 120 / 133 BPM starts on the bar line with the right length; not on hardware |
 
 The crossfade needs audio past the loop end in the file (at least 256 samples); the looper will record past the end.
 If the file ends at the loop end, up to one block (32 samples) of silence remains at the jump.
@@ -31,5 +31,9 @@ The loop starts on the first bar line after the clip starts on the timeline and 
 tempo (fewer if the clip is too short); jump lengths come from a fixed-point accumulator, so the loop stays on the bar
 grid. Tempo changes while a loop plays are not followed yet.
 
-Not on the panel yet (no widgets): the parameters exist, but there is no button or knob for them. Next: controls on
-the Track page, recording that stops after BARS bars. Not flashed.
+**On the device (Loop view):** on the Track page, the B (Info) key steps block 1 (VOL PAN GAIN CUE) -> block 2 (FX1
+FX2 OUT3&4) -> **Loop view** -> block 1. The Loop view shows FILTER, BARS and FADE knobs in block 2's frame (encoders
+1 FILTER, 2 BARS, 3 FADE) and a big LOOP button (lit = on); the stock widgets come back when you leave it or open the
+Track page again. M4 code `src/loop_ui_m4.c`, widgets and state in SRAM4 0x3800A000.
+
+Next: recording that starts on the bar and stops after BARS bars, and the new clip looping right away. Not flashed.

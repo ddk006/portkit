@@ -104,7 +104,8 @@ Tasten (2026-10-26, emu): Matrix 4 x 4, Zeilen PI8 PI12 PI14 PJ1 (nacheinander l
 +0x608), Spalten PC13 PD4 PG3 PH7 über HAL_GPIO_ReadPin 0x08110E00 (einziger Aufrufer: Abfrage 0x08138A84). Die
 Simulation beantwortet ReadPin per Hook (`bbhook.key_read`). Ereigniscodes je Zeile ab 0x3001F7D8. Runner:
 `press <Taste> [s]`, `hold`, `up`, `tap x y [s]` (Bildschirmkoordinaten, keine Spiegelung nötig).
-Zugeordnet: STOP (Code 0xF6), PLAY (0xF7), REC (0xF4); E0/E1 und F9_0..7 (Seitentasten/Encoder?) offen.
+Zugeordnet: STOP (Code 0xF6), PLAY (0xF7), REC (0xF4); F9_0..7 = Seitentasten (0 Mixer, 1 Track, 2 Ausgänge, 3 EQ,
+4 FX, 5 Transport, 6 Projekt, 7 Einstellungen); E1 = B/Info, E0 = Eingangszuordnung. Encoder: noch kein Modell.
 Aufnahme: `tap 287 220` (Rec-Reiter), `tap 36 60` (Kanal 1 scharf), `press PLAY`, `press REC`, ..., `press STOP`.
 Audio-Eingang: `mon 'python "self.Machine[\"sysbus.audioDma\"].InputFrom(5, \"<raw>\")"'` (TDM 8 x 32 Bit).
 Looper-Prototyp in der Simulation (2026-10-26): `--image loop` (out/bluebox/loop). Kerntakt jetzt 480 / 240 MIPS

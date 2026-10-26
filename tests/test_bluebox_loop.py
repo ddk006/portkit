@@ -411,6 +411,12 @@ def main():
     check(e.owners() == [None, None], "slot free after the fade: %s" % e.owners())
     out, e = tone_run(1000, fade=1, off_at=100, on_again_at=100 + bar // 2, blocks=100 + bar + 200)
     check(e.voice()["active"] and rms(out[-50 * N:]) > 0.3 and e.owners()[0] == 0, "LOOP on during the fade cancels it")
+    e = Emu()                                          # LOOP off with FADE while nothing plays: slot freed at once
+    e.init()
+    e.process(0, [(0, P_LOOP, 1), (0, 0x107, 4)])
+    e.process(0, [(0, P_LOOP, 0)])
+    e.process(0, [])
+    check(e.owners() == [None, None], "LOOP off with FADE and no voice playing frees the slot: %s" % e.owners())
     print("PASS" if not fails else f"{fails} FAILED")
     sys.exit(1 if fails else 0)
 

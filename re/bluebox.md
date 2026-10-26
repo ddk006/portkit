@@ -171,6 +171,20 @@ aufnehmen und von SD abspielen, Ausblenden mit Filter. Projektwechsel (= "Preset
   +4 (x, y von unten, w, h; int32), versteckt +0x30, Parameter-Id +0x94, Label +0xF8; 0 VOL, 1 PAN, 2 GAIN, 3 FX1,
   4 FX2, 5 CUE, 6 OUT3&4, 7 (0x15F, nur in 3&4-Mono). Buttons (vtable 0x0814D9C4) +0xE298 + i*0x1D4: Id +0xFA;
   0 REC, 1 MUTE, 2 SOLO, 3 CUE-Schalter (versteckt), 4 SIDE CHAIN (0x2B). Kein freies Widget.
+- **Loop-Ansicht (Build 1.5.1L6, emu):** Tasten: E1 = B/Info (schaltet auf der Track-Seite den Block), E0 = Eingangs-
+  zuordnung (Raster 1..12). Tasten-Handler 0x081354EC: Nachricht 0x8C (Track-Seite mit Block +0x0C) ->
+  showPage(pm, page) 0x0813AA1C (bl @0x08135718; aktuelle Seite pm + 0x34) und setBlock(page, block) 0x08133884
+  (bl @0x08135720; Feld page + 0xEBBC; Track-Taste: Block 0, B: der andere Block). Nachrichten-Handler der Seite
+  (vtable 0x0814E5D4 Slot 13 = 0x081342AC): 0x32 Encoder (Index +0x0C, Delta +0x10; Zuordnung je Block fest),
+  0x63/0x66/0x67/0x141 Update (0x081339B0 -> 0x081339B8: je Regler get 0x08122580, bind 0x08128BD0, fmt 0x08124958,
+  setText 0x08128FC8; Parameterspeicher 0x30018010), 0xD4 Layout. Widgets: setRect vtable +0x20, setHidden +0x2C,
+  addChild 0x0813B994 (verkettete Liste, Seite +0x18/+0x1C). Regler: Wert +0x84, Id +0x94, Typ +0x96, Spur +0x32,
+  drehen 0x08128D9C -> Nachricht 0x6E {+8 Spur, +0xC Id, +0x10 Wert} an den Elter (0x0813BA64). Button: Zustand
+  +0x96, Spur +0xF8, Id +0xFA, +0xFC = senden UND Anzeige invertiert (Leuchten = 0); Tipp = vtable Slot 6 0x081280EC,
+  setOn 0x081280B4. Unser LOOP-Button: eigene vtable-Kopie, Tipp schickt 0x6E selbst. Seite eingebettet im App-
+  Objekt -> eigene Widgets in SRAM4 0x3800A000. B schaltet Block 1 -> Block 2 -> Loop -> Block 1; in der Loop-Ansicht
+  Regler in Block 2s Rahmen (Encoder 1 FILTER, 2 BARS, 3 FADE), LOOP rechts. LOOP-Tipp setzt im M7 den Slot (emu).
+  Fix: LOOP aus mit FADE, während nichts spielt, gibt den Slot sofort frei (vorher blieb er belegt).
 - RAM-Rechnung: frei ~6,4 MB (1,5 + 4,9). 24 Bit mono 3 MB je Slot = 21,8 s (16 Takte nur ab ~176 BPM),
   stereo 10,9 s. Daher SD.
 - Einhängepunkt: noch offen; Kandidaten sind die Kanalkette (Bus 0..11 vor dem Mixer `b988`) oder der Mixer selbst.

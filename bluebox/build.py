@@ -20,7 +20,7 @@ OUT = os.path.join(ROOT, "out", "bluebox")
 STOCK = os.path.join(ROOT, "firmware", "BLUEEURO.BIN")
 STOCK_SHA256 = "fcb04565e2fd5bc15c0b2d0dc913dc99dc74732611e8cef0d7e8e4bb4af7402b"
 BASE = 0x08040000                       # the file is contiguous flash from here (re/bluebox.md)
-VERSION = (0x08149640, b"1.5.1\0\0\0", b"1.5.1L5\0")
+VERSION = (0x08149640, b"1.5.1\0\0\0", b"1.5.1L6\0")
 
 # M7 cave: inside the zero-filled gap 0x0808AC00..0x08090000, below every cave bluelex uses (0x08090000..)
 CAVE7 = (0x0808C000, 0x2000)
@@ -63,7 +63,7 @@ def compile_cave(name, sources, origin, length, cpu=M7):
 
 def feature_loop():
     code, s = compile_cave("loop7", ["loop_m7.c"], *CAVE7)
-    code4, s4 = compile_cave("loop4", ["loop_m4.c"], *CAVE4, cpu=M4)
+    code4, s4 = compile_cave("loop4", ["loop_m4.c", "loop_ui_m4.c"], *CAVE4, cpu=M4)
     sites = (0x08057D1E, 0x08057EF8, 0x08057F06)             # the track player's calls of FUN_08057A00
     patches = [(CAVE7[0], bytes(len(code)), code, "loop7 cave"), (CAVE4[0], bytes(len(code4)), code4, "loop4 cave")]
     patches += [(a, bl(a, 0x08057A00), bl(a, s["loop_voice"]), "voice -> loop_voice") for a in sites]
@@ -74,11 +74,20 @@ def feature_loop():
     patches.append((0x0813714A, bl(0x0813714A, 0x08135E08), bl(0x0813714A, s4["loop_defs"]), "def -> loop_defs"))
     patches.append((0x0812087C, bl(0x0812087C, 0x081205E2), bl(0x0812087C, s4["loop_set_add"]),
                     "set add -> loop_set_add"))
+    # M4 Loop view (src/loop_ui_m4.c): Track page constructor, the key handler's showPage / setBlock, page messages
+    patches.append((0x08135BA2, bl(0x08135BA2, 0x08133470), bl(0x08135BA2, s4["loop_track_ctor"]),
+                    "track ctor -> loop_track_ctor"))
+    patches.append((0x08135718, bl(0x08135718, 0x0813AA1C), bl(0x08135718, s4["loop_show"]), "showPage -> loop_show"))
+    patches.append((0x08135720, bl(0x08135720, 0x08133884), bl(0x08135720, s4["loop_setblock"]),
+                    "setBlock -> loop_setblock"))
+    patches.append((0x0814E608, struct.pack("<I", 0x081342AD), struct.pack("<I", s4["loop_msg"] | 1),
+                    "track page msg ptr = loop_msg"))
     # stream cache vtable 0x08076BD4, slot 2 (read 0x0805B350) -> loop_read (crossfade at the loop point)
     patches.append((0x08076BDC, struct.pack("<I", 0x0805B351), struct.pack("<I", s["loop_read"] | 1),
                     "cache read ptr = loop_read"))
     targets = {s["loop_voice"] & ~1: "loop_voice", s4["loop_defs"] & ~1: "loop_defs",
-               s4["loop_set_add"] & ~1: "loop_set_add"}
+               s4["loop_set_add"] & ~1: "loop_set_add", s4["loop_track_ctor"] & ~1: "loop_track_ctor",
+               s4["loop_show"] & ~1: "loop_show", s4["loop_setblock"] & ~1: "loop_setblock"}
     return patches, targets, {"loop7": len(code), "loop7_free": CAVE7[1] - len(code), "loop4": len(code4),
                               "loop4_free": CAVE4[1] - len(code4)}
 
@@ -117,7 +126,8 @@ def main(args):
             tgt = next(t for t, n in targets.items() if n == what.split(" -> ")[1])
             assert new == bl(addr, tgt), f"{what}: BL at {addr:#x} does not reach {tgt:#x}"
         if " ptr = " in what:
-            assert CAVE7[0] <= struct.unpack("<I", new)[0] & ~1 < CAVE7[0] + CAVE7[1], f"{what}: pointer outside the cave"
+            ptr = struct.unpack("<I", new)[0] & ~1
+            assert any(c[0] <= ptr < c[0] + c[1] for c in (CAVE7, CAVE4)), f"{what}: pointer outside the caves"
     if null:
         assert bytes(data) == stock, "null repack differs from stock"
         print("null repack: identical to stock")

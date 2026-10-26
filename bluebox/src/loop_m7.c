@@ -102,7 +102,8 @@ struct loop_state {
         int32_t mode0;            /* filter mode of the last block: 0 off, 1 low-pass, 2 high-pass */
         int32_t fade_left, fade_total;   /* samples; fade_total 0 = not fading */
         uint8_t fading;           /* LOOP went off with FADE > 0: the loop keeps its slot until the fade ends */
-        uint8_t _p[3];
+        uint8_t seen;             /* a looping voice of this track rendered since the last loop_process */
+        uint8_t _p[2];
     } fx[TRACKS];
     /* the block being rendered (set by loop_voice around the stock voice call, read by loop_read) */
     int32_t cur_track;            /* -1 = none */
@@ -362,6 +363,7 @@ void loop_voice(void *player, void *voice, void *bus, uint32_t a3)
     if (track < TRACKS) {
         fx_block(s, track, (unsigned)n, a3);
         s->cur_asset = v->asset;
+        s->fx[track].seen = 1;
     }
     fw_voice(player, voice, bus, a3);
     if (wrap && v->active) {
@@ -425,6 +427,14 @@ int loop_process(void *obj, void *ctx)
     struct loop_state *s = state();
     unsigned track = *(uint32_t *)((uint8_t *)obj + P_QUEUE);
     if (track < TRACKS) {
+        /* a fade with nothing playing (transport stopped, no clip) would never end: free the slot at once */
+        if (s->fx[track].fading && !s->fx[track].seen) {
+            s->fx[track].fading = 0;
+            s->fx[track].fade_total = 0;
+            s->fx[track].gain = 1.f;
+            release(s, track);
+        }
+        s->fx[track].seen = 0;
         void *q = fw_queue(ctx, track);
         struct fw_ev ev;
         for (unsigned i = 0; fw_next_ev(q, i, &ev); i++) {
