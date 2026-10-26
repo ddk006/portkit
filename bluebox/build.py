@@ -20,7 +20,7 @@ OUT = os.path.join(ROOT, "out", "bluebox")
 STOCK = os.path.join(ROOT, "firmware", "BLUEEURO.BIN")
 STOCK_SHA256 = "fcb04565e2fd5bc15c0b2d0dc913dc99dc74732611e8cef0d7e8e4bb4af7402b"
 BASE = 0x08040000                       # the file is contiguous flash from here (re/bluebox.md)
-VERSION = (0x08149640, b"1.5.1\0\0\0", b"1.5.1L4\0")
+VERSION = (0x08149640, b"1.5.1\0\0\0", b"1.5.1L5\0")
 
 # M7 cave: inside the zero-filled gap 0x0808AC00..0x08090000, below every cave bluelex uses (0x08090000..)
 CAVE7 = (0x0808C000, 0x2000)

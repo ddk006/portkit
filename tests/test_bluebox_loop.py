@@ -20,7 +20,11 @@ Tracks and slots (loop_process with the stock queue / event / player modelled; M
   - LOOP takes one of two slots in switch-on order; a third track waits and gets the next free slot;
   - BARS is kept per track and clamped to 1..16; events for another queue are ignored; the stock process always runs;
   - LOOP off ends a looping clip within a block;
-  - the M4 hooks call the stock function, then define / add LOOP and BARS.
+  - the M4 hooks call the stock function, then define / add LOOP, BARS, FILTER and FADE.
+Filter and fade (FILTER / FADE per track; the voice's read is modelled right after loop_voice, as it happens inside):
+  - FILTER < 0 low-passes (high tone down, low tone through), > 0 high-passes, 0 leaves the signal untouched;
+  - LOOP off with FADE = 1 bar: the level follows a smooth fade to zero over one bar, then the clip ends and the
+    slot is free; LOOP on during the fade cancels it.
 """
 import os
 import struct
@@ -41,6 +45,7 @@ TRANSPORT, A3 = 0x24003000, 0x24003100
 FW_QUEUE, FW_NEXT_EV, FW_PLAYER, QUEUE = 0x08053C8C, 0x0804E938, 0x080574EC, 0x24004000
 FW_DEF, FW_ADD = 0x08135E08, 0x081205E2
 OWNER, CHBARS, WANT = STATE + 0x710, STATE + 0x712, STATE + 0x71E
+CHFILTER, CHFADE = STATE + 0x720, STATE + 0x738
 W = 2 * 3.141592653589793 * 440 / 48000
 N = 32
 VOICE_FMT = "<BBxxIq8xqq"                          # active, ending, asset, pos, delay, left
@@ -116,6 +121,13 @@ class Emu:
         self.events = events
         return self.call(self.sym_proc, PLAYER, 0)
 
+    def init(self, mask=0, bars=0):
+        """let the code initialise its state (as at power-up), then set the debug mask / global bars"""
+        self.uc.mem_write(STATE, b"\0" * 0x900)
+        self.process(15, [])                            # state() initialises; track 15 has no queue
+        self.uc.mem_write(STATE + 4, struct.pack("<I", mask))
+        self.uc.mem_write(STATE + 12, struct.pack("<I", bars))
+
     def owners(self):
         o = bytes(self.uc.mem_read(OWNER, 2))
         return [b - 1 if b else None for b in o]
@@ -152,7 +164,8 @@ class Emu:
         asset, l, r, n = struct.unpack("<IIII", bytes(uc.mem_read(sp, 16)))
         ok = pos + n <= self.file_len
         if ok:
-            vals = struct.pack(f"<{n}f", *(0.5 * math.sin(W * (pos + i)) for i in range(n)))
+            fn = getattr(self, "read_stub_fn", None) or (lambda p: 0.5 * math.sin(W * p))
+            vals = struct.pack(f"<{n}f", *(fn(pos + i) for i in range(n)))
             for buf in (l, r):
                 if buf:
                     uc.mem_write(buf, vals)
@@ -192,7 +205,7 @@ class Emu:
 
 def play(track, length, blocks, start=5000, ending=0, mask=None):
     e = Emu()
-    e.uc.mem_write(STATE, struct.pack("<II", 0x504F4F4C, 0xFFF))      # debug mask: every track loops
+    e.init(mask=0xFFF)                                                # debug mask: every track loops
     e.uc.mem_write(PLAYER + 0x18, struct.pack("<I", track))
     e.voice(active=1, ending=ending, asset=7, pos=start, delay=0, left=length)
     e.block()                                         # first block initialises the state (mask = all)
@@ -236,7 +249,7 @@ def main():
     def render(file_extra, L=3000, B=400, start=5000):
         """the voice's view: per block, its read position before loop_voice, then the read there"""
         e = Emu()
-        e.uc.mem_write(STATE, struct.pack("<II", 0x504F4F4C, 0xFFF))
+        e.init(mask=0xFFF)
         e.file_len = start + L + file_extra
         e.uc.mem_write(PLAYER + 0x18, struct.pack("<I", 0))
         e.voice(active=1, ending=0, asset=7, pos=start, delay=0, left=L)
@@ -271,7 +284,7 @@ def main():
         e = Emu()
         e.a3 = A3
         e.uc.mem_write(A3, struct.pack("<I", TRANSPORT))
-        e.uc.mem_write(STATE, struct.pack("<IIII", 0x504F4F4C, 0xFFF, 0, bars))
+        e.init(mask=0xFFF, bars=bars)
         e.uc.mem_write(PLAYER + 0x18, struct.pack("<I", 0))
         e.voice(active=1, ending=0, asset=7, pos=0, delay=0, left=clip)
         spt = 48000 * 60 / (960 * bpm)
@@ -304,13 +317,14 @@ def main():
     check(len(jumps) == 2 and all(sz == 50000 for sz, _ in jumps), "clip shorter than a bar: loops whole (%s)" % [j[0] for j in jumps])
     # --- tracks and slots
     e = Emu()
-    e.uc.mem_write(STATE, struct.pack("<IIII", 0x504F4F4C, 0, 0, 0))
+    e.init()
     P_LOOP, P_BARS = 0x103, 0x104
+    calls0 = e.player_calls
     ret = e.process(0, [(0, P_LOOP, 1)])
     e.process(1, [(1, P_LOOP, 1)])
     e.process(2, [(2, P_LOOP, 1)])
     check(e.owners() == [0, 1], "two slots in switch-on order: %s" % e.owners())
-    check(ret == 77 and e.player_calls == 3, "stock player process runs and its result is returned")
+    check(ret == 77 and e.player_calls - calls0 == 3, "stock player process runs and its result is returned")
     e.process(0, [(0, P_LOOP, 0)])
     check(e.owners() == [2, 1], "track 0 off: waiting track 2 gets its slot: %s" % e.owners())
     e.process(1, [(1, P_BARS, 8), (5, P_BARS, 3)])
@@ -321,7 +335,7 @@ def main():
 
     # LOOP off ends a looping clip
     e = Emu()
-    e.uc.mem_write(STATE, struct.pack("<IIII", 0x504F4F4C, 0, 0, 0))
+    e.init()
     e.process(0, [(0, P_LOOP, 1)])
     e.uc.mem_write(PLAYER + 0x18, struct.pack("<I", 0))
     e.voice(active=1, ending=0, asset=7, pos=5000, delay=0, left=1000)
@@ -341,8 +355,62 @@ def main():
                               ("loop_set_add", (0x30000100, 0x2A, 500), b"")):
         m4.call(Emu.symbol(name, "loop4.elf"), *args, stack=stack)
     calls = [(k, hex(i)) for k, i, _ in m4.m4_calls]
-    check(calls == [("def", "0x117"), ("def", "0x103"), ("def", "0x104"), ("add", "0x2a"), ("add", "0x103"),
-                    ("add", "0x104")], "M4: stock call first, then LOOP and BARS: %s" % calls)
+    check(calls == [("def", "0x117"), ("def", "0x103"), ("def", "0x104"), ("def", "0x105"), ("def", "0x107"),
+                    ("add", "0x2a"), ("add", "0x103"), ("add", "0x104"), ("add", "0x105"), ("add", "0x107")],
+          "M4: stock call first, then LOOP, BARS, FILTER, FADE: %s" % calls)
+    # --- filter and fade
+    def tone_run(freq, filt=0, fade=0, off_at=None, on_again_at=None, blocks=600, bpm=120):
+        """track 0 looping a sine `freq` file (BARS 0: whole 30000-sample clip); returns output samples, emu"""
+        e = Emu()
+        e.init()
+        e.a3 = A3
+        e.uc.mem_write(A3, struct.pack("<I", TRANSPORT))
+        e.uc.mem_write(TRANSPORT + 0x18, struct.pack("<f", bpm))
+        e.process(0, [(0, P_LOOP, 1), (0, 0x105, filt), (0, 0x107, fade)])
+        w = 2 * math.pi * freq / 48000
+        e.read_stub_fn = lambda p: 0.5 * math.sin(w * p)
+        e.uc.mem_write(PLAYER + 0x18, struct.pack("<I", 0))
+        e.voice(active=1, ending=0, asset=7, pos=0, delay=0, left=30000)
+        out = []
+        for b in range(blocks):
+            if b == off_at:
+                e.process(0, [(0, P_LOOP, 0)])
+            if b == on_again_at:
+                e.process(0, [(0, P_LOOP, 1)])
+            e.uc.mem_write(PLAYER + 0x18, struct.pack("<I", 0))
+            if not e.voice()["active"]:
+                out += [0.0] * N
+                continue
+            p = e.voice()["pos"]
+            e.block()
+            out += e.read(p, N)[1]
+        return out, e
+
+    def rms(x):
+        return math.sqrt(sum(v * v for v in x) / len(x)) if x else 0.0
+
+    hi_lp, _ = tone_run(5000, filt=-800, blocks=300)
+    lo_lp, _ = tone_run(100, filt=-800, blocks=300)
+    hi_hp, _ = tone_run(5000, filt=800, blocks=300)
+    lo_hp, _ = tone_run(100, filt=800, blocks=300)
+    flat, _ = tone_run(1000, filt=0, blocks=300)
+    tail = slice(4800, None)
+    check(rms(hi_lp[tail]) < 0.01 and rms(lo_lp[tail]) > 0.3, "FILTER -800 low-pass: 5 kHz %.4f, 100 Hz %.3f"
+          % (rms(hi_lp[tail]), rms(lo_lp[tail])))
+    check(rms(lo_hp[tail]) < 0.03 and rms(hi_hp[tail]) > 0.3, "FILTER +800 high-pass: 100 Hz %.4f, 5 kHz %.3f"
+          % (rms(lo_hp[tail]), rms(hi_hp[tail])))
+    check(all(abs(v - 0.5 * math.sin(2 * math.pi * 1000 / 48000 * (i % 30000))) < 1e-4 for i, v in enumerate(flat[:20000])),
+          "FILTER 0: signal untouched")
+    bar = 96000 // N                                   # one bar at 120 BPM, in blocks
+    out, e = tone_run(1000, fade=1, off_at=100, blocks=100 + bar + 20)
+    seg = lambda b0, b1: rms(out[b0 * N:b1 * N])
+    lv = [seg(100 + bar * k // 4, 100 + bar * k // 4 + 50) for k in range(4)]
+    after = seg(100 + bar + 5, 100 + bar + 20)
+    check(lv[0] > lv[1] > lv[2] > lv[3] > after and after < 1e-4 and not e.voice()["active"],
+          "FADE 1 bar: level %s, after %.5f, clip ended" % (["%.3f" % x for x in lv], after))
+    check(e.owners() == [None, None], "slot free after the fade: %s" % e.owners())
+    out, e = tone_run(1000, fade=1, off_at=100, on_again_at=100 + bar // 2, blocks=100 + bar + 200)
+    check(e.voice()["active"] and rms(out[-50 * N:]) > 0.3 and e.owners()[0] == 0, "LOOP on during the fade cancels it")
     print("PASS" if not fails else f"{fails} FAILED")
     sys.exit(1 if fails else 0)
 

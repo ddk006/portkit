@@ -158,6 +158,19 @@ aufnehmen und von SD abspielen, Ausblenden mit Filter. Projektwechsel (= "Preset
   Unicorn 24/24. Renode: M4 definiert beide Parameter; LOOP = 1 / BARS = 1 per Postfach für Spur 0 -> Loop ab 64725,
   96000 Samples; LOOP = 0 -> Signal endet sofort (6,55 s statt Loop bis 9 s). Der M4 schickt die Standardwerte der
   neuen Kanal-Parameter selbst an den M7 (BARS = 4 für Spur 1 gesehen). Noch keine Widgets im Panel.
+- **FILTER/FADE (Build 1.5.1L5):** 0x105 FILTER (Typ 9 wie Pan, -1000..1000), 0x107 FADE (0..16 Takte). Filter
+  (TPT-SVF, Q 0,8) und Lautstärke im Lesepfad nach der Überblendung; `loop_voice` setzt vor der Stock-Stimme die
+  Werte des Blocks. Zustand mit Layout-Version im Magic ("LOO5"). Unicorn 30/30. Renode (440-Hz-Clip auf Spur 1,
+  1-kHz-Ton am Eingang): FILTER -850 senkt den Loop um 19 dB, FADE 1 Takt blendet über 2 s weich aus, Slot danach
+  frei; der Eingang bleibt die ganze Zeit hörbar (0,79), nach dem Ende des Clips 1,10: stock senkt den Eingang
+  ~3 dB, solange der Clip der Spur spielt (Ursache nicht untersucht).
+- **Seiten und Tasten (emu):** Matrix-Codes 0xF9 / Param 0..7 = Seitentasten: 0 Mixer, 1 **Track**, 2 Ausgänge,
+  3 EQ, 4 FX, 5 Transport (Play From / Punch In / Punch Out), 6 Projekt, 7 Einstellungen; E0 (Zeile 0, Spalte 0):
+  Spuranzahl-Menü. Track-Seite = Seitenobjekt eingebettet im App-Objekt (App + 0xCFB70, nächste Seite + 0xDE810,
+  vtable 0x0814E5D4, Konstruktor 0x08133470 aus 0x08135B34). Regler (vtable 0x0814DA10) +0xC398 + i*0x3D0: Rechteck
+  +4 (x, y von unten, w, h; int32), versteckt +0x30, Parameter-Id +0x94, Label +0xF8; 0 VOL, 1 PAN, 2 GAIN, 3 FX1,
+  4 FX2, 5 CUE, 6 OUT3&4, 7 (0x15F, nur in 3&4-Mono). Buttons (vtable 0x0814D9C4) +0xE298 + i*0x1D4: Id +0xFA;
+  0 REC, 1 MUTE, 2 SOLO, 3 CUE-Schalter (versteckt), 4 SIDE CHAIN (0x2B). Kein freies Widget.
 - RAM-Rechnung: frei ~6,4 MB (1,5 + 4,9). 24 Bit mono 3 MB je Slot = 21,8 s (16 Takte nur ab ~176 BPM),
   stereo 10,9 s. Daher SD.
 - Einhängepunkt: noch offen; Kandidaten sind die Kanalkette (Bus 0..11 vor dem Mixer `b988`) oder der Mixer selbst.
