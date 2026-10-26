@@ -130,6 +130,14 @@ aufnehmen und von SD abspielen, Ausblenden mit Filter. Projektwechsel (= "Preset
   144597 -> 4 und 144612 -> 19 (Clip 144625 Samples), Abstand der Sprünge 3,013 s (keine Drift); an jedem Sprung ein
   Knackser (Signalsprung 185x / 480x über der Sinuskrümmung). SRAM4 unter 0x3800F000 blieb während des Laufs
   unberührt (Canary). Nicht am Gerät gehört.
+- **Überblendung (2026-10-26, Build 1.5.1L2):** `loop_read` ersetzt den Cache-Lesezugriff (vtable 0x08076BD4 Slot 2,
+  `read(this, fn, int64 pos, asset, float *l, float *r, n)`, Float-Samples, != 0 = ok; Cache-Blöcke 0x9800 Samples
+  je Kanal). Nach einem Sprung werden die ersten 256 Samples ab der Landestelle aus Kopf x(p) (einblenden) und
+  Fortsetzung hinter dem Loop-Ende x(p + len) (ausblenden) gemischt, gleiche Leistung. Scheitert der Lesezugriff des
+  letzten Blocks vor dem Sprung am Dateiende, liest `loop_read` den Teil bis zum Loop-Ende einzeln (sonst spielt die
+  Stimme den ganzen Block still). Unicorn 13/13. Renode (Sinus-Clip mit 1 s Audio hinter dem Clip-Ende): kein
+  Knackser mehr (max. 2,8x der Sinuskrümmung, vorher 185x/480x), Pegel wie stock (0,310 beide). Offen: ein früherer
+  Lauf mit anderem Kartenabbild zeigte 0,62 (Ursache nicht geklärt).
 - RAM-Rechnung: frei ~6,4 MB (1,5 + 4,9). 24 Bit mono 3 MB je Slot = 21,8 s (16 Takte nur ab ~176 BPM),
   stereo 10,9 s. Daher SD.
 - Einhängepunkt: noch offen; Kandidaten sind die Kanalkette (Bus 0..11 vor dem Mixer `b988`) oder der Mixer selbst.

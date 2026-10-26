@@ -20,7 +20,7 @@ OUT = os.path.join(ROOT, "out", "bluebox")
 STOCK = os.path.join(ROOT, "firmware", "BLUEEURO.BIN")
 STOCK_SHA256 = "fcb04565e2fd5bc15c0b2d0dc913dc99dc74732611e8cef0d7e8e4bb4af7402b"
 BASE = 0x08040000                       # the file is contiguous flash from here (re/bluebox.md)
-VERSION = (0x08149640, b"1.5.1\0\0\0", b"1.5.1L1\0")
+VERSION = (0x08149640, b"1.5.1\0\0\0", b"1.5.1L2\0")
 
 # M7 cave: inside the zero-filled gap 0x0808AC00..0x08090000, below every cave bluelex uses (0x08090000..)
 CAVE7 = (0x0808C000, 0x4000)
@@ -62,6 +62,9 @@ def feature_loop():
     sites = (0x08057D1E, 0x08057EF8, 0x08057F06)             # the track player's calls of FUN_08057A00
     patches = [(CAVE7[0], bytes(len(code)), code, "loop7 cave")]
     patches += [(a, bl(a, 0x08057A00), bl(a, s["loop_voice"]), "voice -> loop_voice") for a in sites]
+    # stream cache vtable 0x08076BD4, slot 2 (read 0x0805B350) -> loop_read (crossfade at the loop point)
+    patches.append((0x08076BDC, struct.pack("<I", 0x0805B351), struct.pack("<I", s["loop_read"] | 1),
+                    "cache read ptr = loop_read"))
     targets = {s["loop_voice"] & ~1: "loop_voice"}
     return patches, targets, {"loop7": len(code), "loop7_free": CAVE7[1] - len(code)}
 
@@ -99,6 +102,8 @@ def main(args):
         if " -> " in what:
             tgt = next(t for t, n in targets.items() if n == what.split(" -> ")[1])
             assert new == bl(addr, tgt), f"{what}: BL at {addr:#x} does not reach {tgt:#x}"
+        if " ptr = " in what:
+            assert struct.unpack("<I", new)[0] & ~1 >= CAVE7[0], f"{what}: pointer outside the cave"
     if null:
         assert bytes(data) == stock, "null repack differs from stock"
         print("null repack: identical to stock")

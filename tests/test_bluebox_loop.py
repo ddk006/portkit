@@ -7,6 +7,11 @@ read n frames at pos, pos += n, left -= n, and when left < 1 the voice ends (act
   - a looping track keeps its voice alive and keeps  left == len - (pos - start)  (no drift), wrapping on time;
   - a track without its mask bit ends as stock;
   - a voice that is fading out (ending) is not looped.
+Crossfade (loop_read, replacing the cache read; the stock read FUN_0805B350 is modelled as a 440 Hz sine "file"):
+  - every block is rendered as the voice does (loop_voice, then a read at the voice's position): the output stays
+    smooth across the jumps (second difference within a few times that of the sine), with and without audio past the
+    loop end in the file;
+  - reads outside the crossfade zone, before the first jump and of other assets pass through unchanged.
 """
 import os
 import struct
@@ -21,7 +26,9 @@ IMG = os.path.join(ROOT, "out", "bluebox", "loop", "BLUEEURO.BIN")
 BASE, SRAM4, STATE = 0x08040000, 0x38000000, 0x3800F000
 STACK, RAM = 0x20010000, 0x24000000
 PLAYER, VOICE, BUS = 0x24001000, 0x24001100, 0x24001200
-FW_VOICE, FW_FRAMES, RET = 0x08057A00, 0x0804D4C0, 0x24000000
+FW_VOICE, FW_FRAMES, FW_READ, RET = 0x08057A00, 0x0804D4C0, 0x0805B350, 0x24000000
+BUFL, BUFR, BUFT = 0x24002000, 0x24002400, 0x24002800
+W = 2 * 3.141592653589793 * 440 / 48000
 N = 32
 VOICE_FMT = "<BBxxIq8xqq"                          # active, ending, asset, pos, delay, left
 
@@ -38,7 +45,10 @@ class Emu:
         self.uc.mem_write(RET, b"\x00\xbe")             # bkpt: end of a call
         self.uc.hook_add(UC_HOOK_CODE, self.stub, begin=FW_VOICE, end=FW_VOICE)
         self.uc.hook_add(UC_HOOK_CODE, self.stub, begin=FW_FRAMES, end=FW_FRAMES)
+        self.uc.hook_add(UC_HOOK_CODE, self.read_stub, begin=FW_READ, end=FW_READ)
         self.sym = self.symbol("loop_voice")
+        self.sym_read = self.symbol("loop_read")
+        self.file_len = 1 << 40
         self.reads = []
 
     @staticmethod
@@ -71,6 +81,39 @@ class Emu:
                         v["active"] = 0
                 self.voice(**v)
         uc.reg_write(UC_ARM_REG_PC, uc.reg_read(UC_ARM_REG_LR))
+
+    def read_stub(self, uc, addr, size, _):
+        """stock read: x(p) = 0.5 sin(W p) for 0 <= p < file_len, both channels; 0 = failure past the end"""
+        import math
+        pos = (uc.reg_read(UC_ARM_REG_R3) << 32) | uc.reg_read(UC_ARM_REG_R2)
+        sp = uc.reg_read(UC_ARM_REG_SP)
+        asset, l, r, n = struct.unpack("<IIII", bytes(uc.mem_read(sp, 16)))
+        ok = pos + n <= self.file_len
+        if ok:
+            vals = struct.pack(f"<{n}f", *(0.5 * math.sin(W * (pos + i)) for i in range(n)))
+            for buf in (l, r):
+                if buf:
+                    uc.mem_write(buf, vals)
+        uc.reg_write(UC_ARM_REG_R0, 1 if ok else 0)
+        uc.reg_write(UC_ARM_REG_PC, uc.reg_read(UC_ARM_REG_LR))
+
+    def read(self, pos, n, asset=7):
+        """loop_read(cache, fn, pos, asset, l, r, n) -> (ok, left samples)"""
+        uc = self.uc
+        uc.mem_write(BUFL, b"\0" * 4 * n)
+        sp = STACK - 16
+        uc.mem_write(sp, struct.pack("<IIII", asset, BUFL, BUFR, n))
+        uc.reg_write(UC_ARM_REG_SP, sp)
+        uc.reg_write(UC_ARM_REG_LR, RET | 1)
+        for reg, v in ((UC_ARM_REG_R0, 0), (UC_ARM_REG_R1, 0), (UC_ARM_REG_R2, pos & 0xFFFFFFFF),
+                       (UC_ARM_REG_R3, pos >> 32)):
+            uc.reg_write(reg, v)
+        uc.emu_start(self.sym_read | 1, RET, count=200000)
+        ok = uc.reg_read(UC_ARM_REG_R0)
+        vals = list(struct.unpack(f"<{n}f", bytes(uc.mem_read(BUFL, 4 * n))))
+        if not ok:
+            vals = [0.0] * n                            # the voice zero-fills on a failed read
+        return ok, vals
 
     def block(self):
         uc = self.uc
@@ -125,6 +168,40 @@ def main():
 
     e = play(track=0, length=20, blocks=10)            # clip shorter than a block: left alone (stock end)
     check(e.voice()["active"] == 0, "clip shorter than a block ends as stock")
+    import math
+
+    def render(file_extra, L=3000, B=400, start=5000):
+        """the voice's view: per block, its read position before loop_voice, then the read there"""
+        e = Emu()
+        e.file_len = start + L + file_extra
+        e.uc.mem_write(PLAYER + 0x18, struct.pack("<I", 0))
+        e.voice(active=1, ending=0, asset=7, pos=start, delay=0, left=L)
+        out = []
+        for _ in range(B):
+            p = e.voice()["pos"]
+            e.block()
+            out += e.read(p, N)[1]
+        return e, out
+
+    lim = 0.5 * W * W
+    e, out = render(1000)
+    d2 = max(abs(out[i + 1] - 2 * out[i] + out[i - 1]) for i in range(1, len(out) - 1))
+    check(d2 < 4 * lim, "crossfade, audio past the loop end: max 2nd diff %.4f (sine %.4f), %d jumps"
+          % (d2, lim, e.state()[2]))
+    e, out = render(0)                                 # file ends at the loop end: no silent block before a jump
+    runs, run = [], 0
+    for v in out[200:]:
+        run = run + 1 if v == 0.0 else 0
+        runs.append(run)
+    check(max(runs) < N, "file ends at the loop end: longest silence %d samples (< one block), %d jumps"
+          % (max(runs), e.state()[2]))
+    e, out = render(1000, B=60)                        # first pass only (2 * 32 * 60 < 3000 + start offset): untouched
+    check(all(abs(out[i] - 0.5 * math.sin(W * (5000 + i))) < 1e-5 for i in range(len(out))), "no blend before the first jump")
+    e, _ = render(1000)
+    ok, vals = e.read(5000 + 10, N, asset=9)           # another asset in the zone: pass through
+    check(all(abs(v - 0.5 * math.sin(W * (5010 + i))) < 1e-5 for i, v in enumerate(vals)), "other assets pass through")
+    ok, vals = e.read(5000 + 1000, N)                  # same asset outside the zone: pass through
+    check(all(abs(v - 0.5 * math.sin(W * (6000 + i))) < 1e-5 for i, v in enumerate(vals)), "reads outside the zone pass through")
     print("PASS" if not fails else f"{fails} FAILED")
     sys.exit(1 if fails else 0)
 
