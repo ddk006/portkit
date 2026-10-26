@@ -1,0 +1,29 @@
+# bluebox eurorack boot, included by sim/bluebox_run.py (which replaces $simdir textually and includes
+# sim/PortkitHSEM.cs first). Needs $bin and $repl.
+# The file is contiguous flash from 0x08040000: M7 image there, the 0x080E0000 block, the M4 image at 0x08100000.
+# The bootloader is not in it; both cores start at their vector tables.
+mach create "bluebox"
+machine LoadPlatformDescription $repl
+sysbus LoadBinary $bin 0x08040000
+cpu VectorTableOffset 0x08040000
+cpu SP `sysbus ReadDoubleWord 0x08040000`
+cpu PC `sysbus ReadDoubleWord 0x08040004`
+cpu1 VectorTableOffset 0x08100000
+cpu1 SP `sysbus ReadDoubleWord 0x08100000`
+cpu1 PC `sysbus ReadDoubleWord 0x08100004`
+logLevel 2
+# DMA2D workarounds as for the micro (sim/boot.resc)
+sysbus WriteDoubleWord 0x5200101C 0x1
+sysbus WriteDoubleWord 0x5200101C 0x0
+sysbus WriteDoubleWord 0x52001024 0x1
+sysbus WriteDoubleWord 0x52001024 0x0
+python "self.Machine['sysbus.dma2d'].IRQ.Disconnect()"
+# Renode reports the M7's CPUID on cpu1 as well (ModelID 0x411FC272 for cortex-m4f). The M4 reads it twice (CubeMX
+# dual-core checks: main 0x0810D5D0, HAL_GetCurrentCPUID 0x0810EB52): give it the CM4 value there.
+python "import sys; sys.path.append('$simdir')"
+cpu1 AddHook 0x0810D5D2 "import bbhook; bbhook.cpuid_r3(self)"
+cpu1 AddHook 0x0810EB54 "import bbhook; bbhook.cpuid_r3(self)"
+# The M4 waits in HAL_PWREx_EnterSTOPMode (D2, WFE at 0x08112E1C) until the M7 releases HSEM 0; on the chip that
+# release wakes it through an event. Renode's WFE does not wake on it: the hook skips the WFE and halts cpu1, the HSEM
+# model (sim/PortkitHSEM.cs) resumes it on the release.
+cpu1 AddHook 0x08112E1C "import bbhook; bbhook.m4_wfe(self, machine)"

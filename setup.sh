@@ -6,6 +6,7 @@ cd "$(dirname "$0")"
 mkdir -p repos firmware re out
 [ -d repos/blackbox-mod ] || git clone --depth 1 https://github.com/j3threejay/blackbox-mod.git repos/blackbox-mod
 [ -d repos/bitbox-micro-fw-patch ] || git clone --depth 1 https://github.com/modularpatcher/bitbox-micro-fw-patch.git repos/bitbox-micro-fw-patch
+[ -d repos/bluelex-bluebox-euro ] || git clone --depth 1 https://github.com/lexnels/bluelex-bluebox-euro.git repos/bluelex-bluebox-euro
 
 [ -d .venv ] || python3 -m venv .venv
 .venv/bin/pip -q install capstone unicorn

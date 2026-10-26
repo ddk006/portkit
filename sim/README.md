@@ -79,3 +79,31 @@ Kopfzeile der Master-Seiten: die der Settings-Seite (Version).
 CV-Eingaenge: die 8 ADC-Kanaele (Mittelung 0x08046750, DMA2 Stream 0 -> 0x2407BCC0) sind die CV-Eingaenge (Kyrill).
 
 Naechste Schritte: Pad-Wiedergabe ueber die Engine (warum Vorhoeren?), Encoder, CV-Einspeisung, MIDI-Pads.
+
+# bluebox eurorack in Renode (2026-10-25)
+
+Firmware 1.5.1 (`firmware/BLUEEURO.BIN`), beide Kerne: M7 (`cpu`) und M4 (`cpu1`, eigener NVIC). Details in
+`re/bluebox.md`. Lauf: `python3 sim/bluebox_run.py [--sd <img>] wait 12 shot main` -> `out/sim/bluebox/main.png`
+(Aktionen: wait, pc, read, dump, shot, watch, watchv, fill, mon). Ca. 10x langsamer als Echtzeit (12 s ~ 2 min).
+
+- `bluebox.repl`: H743-Basis + Cortex-M4 (`cpu1`, NVIC nur für cpu1 registriert); Interrupts (EXTI, Timer, DMA1,
+  ADC, SDMMC, LTDC) an beide NVICs. PWR mit Zustand (VOS0 braucht LDOEN, ACTVOS). D2-SRAM1..3 zusätzlich unter
+  0x10000000 (der M7 liest das Postfach über 0x10040000). I2C1: Codecs 0x44/0x45 (Dummy), GT911 0x5D. SAI1..4 als
+  Stubs, DMA2 = `PortkitAudioDMA` mit 1500 Hz (32 Frames je Hälfte).
+- `PortkitHSEM.cs`: HSEM mit Kern-Id je Zugriff (CM7 = 3, CM4 = 1) und den C2-Registern; weckt den M4 aus seinem
+  WFE in `EnterSTOPMode`, sobald der M7 HSEM 0 freigibt.
+- `bluebox_boot.resc` + `bbhook.py`: Renode meldet auch auf `cortex-m4f` die CPUID des M7; die zwei CPUID-Lesestellen
+  des M4 bekommen per Hook 0x410FC241. Weitere Hooks: Parameter-Definitionen (`param_def`, `param_list`),
+  M7-SDRAM-Allokationen.
+- `sd_bluebox.resc`: SD-Karte über die Diskio-Hooks (`sdhook.py`) auf cpu1. Leere Karte: `mksd.py <leerer Ordner> <img>`.
+
+Stand: Splash nach ~0,5 s; mit SD-Karte nach ~8-12 s virtuell die Einstellungsseite (252MB / 1.5.1 / Brightness /
+Bright Fine / MIDIStopRcv, unten Tuner / Scope / DiskMode). Audio-Engine läuft (Graph mit 64 Knoten im RAM). Offen:
+Eingaben (Tasten/Encoder/Touch-Zuordnung), Audio-Ein-/Ausgang (welcher SAI-Slot welcher Kanal), MIDI.
+Tasten (2026-10-26, emu): Matrix 4 x 4, Zeilen PI8 PI12 PI14 PJ1 (nacheinander low, 0x08138B2C, Index Objekt
++0x608), Spalten PC13 PD4 PG3 PH7 über HAL_GPIO_ReadPin 0x08110E00 (einziger Aufrufer: Abfrage 0x08138A84). Die
+Simulation beantwortet ReadPin per Hook (`bbhook.key_read`). Ereigniscodes je Zeile ab 0x3001F7D8. Runner:
+`press <Taste> [s]`, `hold`, `up`, `tap x y [s]` (Bildschirmkoordinaten, keine Spiegelung nötig).
+Zugeordnet: STOP (Code 0xF6), PLAY (0xF7), REC (0xF4); E0/E1 und F9_0..7 (Seitentasten/Encoder?) offen.
+Aufnahme: `tap 287 220` (Rec-Reiter), `tap 36 60` (Kanal 1 scharf), `press PLAY`, `press REC`, ..., `press STOP`.
+Audio-Eingang: `mon 'python "self.Machine[\"sysbus.audioDma\"].InputFrom(5, \"<raw>\")"'` (TDM 8 x 32 Bit).

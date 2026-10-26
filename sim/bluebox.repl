@@ -1,0 +1,219 @@
+// 1010music bluebox eurorack 1.5.1 (STM32H7 dual core, Renode 1.17): the stock H743 description plus a Cortex-M4.
+// The M7 (cpu, image at 0x08040000) runs audio and USB, the M4 (cpu1, image at 0x08100000) the UI, SD card, ADC and
+// MIDI. Each core sees its own NVIC at 0xE000E000; peripheral interrupts go to both, as on the chip.
+using "platforms/cpus/stm32h743.repl"
+
+nvic: @ {
+        sysbus new Bus.BusPointRegistration { address: 0xE000E000; cpu: cpu }
+    }
+
+cpu1: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4f"
+    nvic: nvic1
+
+nvic1: IRQControllers.NVIC @ {
+        sysbus new Bus.BusPointRegistration { address: 0xE000E000; cpu: cpu1 }
+    }
+    priorityMask: 0xF0
+    systickFrequency: 240000000
+    -> cpu1@0
+
+// PWR with state: the M7 asks for VOS0 (HAL_PWREx_ControlVoltageScaling 0x08061388), which needs LDOEN in CR3 and
+// CSR1.ACTVOS following D3CR.VOS, ACTVOSRDY / VOSRDY set. Renode's stub returns constants (fails into Error_Handler).
+pwr: @none
+pwrState: Python.PythonPeripheral @ sysbus 0x58024800
+    size: 0x400
+    initable: true
+    script: '''
+if request.IsInit:
+    regs = {0x00: 0xF000C000, 0x0C: 0x00000046, 0x18: 0x00004000}
+elif request.IsRead:
+    o = request.Offset
+    if o == 0x00:
+        request.Value = regs.get(0, 0) | 0x100
+    elif o == 0x04:
+        request.Value = 0x2000 | (regs.get(0x18, 0) & 0xC000)
+    elif o == 0x0C:
+        request.Value = regs.get(0x0C, 0) | 0x4000002
+    elif o == 0x18:
+        request.Value = regs.get(0x18, 0) | 0x2000
+    else:
+        request.Value = regs.get(o, 0)
+else:
+    regs[request.Offset] = request.Value
+'''
+
+// M4-side peripherals: interrupts to both cores
+ltdc:
+    -> nvic@88 | nvic1@88
+dma2d:
+    -> nvic@90 | nvic1@90
+sdmmc:
+    IRQ -> nvic@49 | nvic1@49
+
+// Interrupts to both cores (the chip routes every line to both NVICs; each core enables its own). EXTI and the
+// combined inputs as in stm32h7.repl, each with the M4's NVIC added; then the peripherals the M4 uses.
+exti:
+    [0-4] -> nvic@[6-10] | nvic1@[6-10]
+    [5-9] -> nvicInput23@[0-4]
+    [10-15] -> nvicInput40@[0-5]
+    [16-19] -> nvic@[1, 41, 2, 3] | nvic1@[1, 41, 2, 3]
+    [20, 21] -> nvicInput137@[0-1]
+    [22-24] -> nvic@[31, 33, 72] | nvic1@[31, 33, 72]
+    [26-29] -> nvic@[37-39, 71] | nvic1@[37-39, 71]
+    [30-33] -> nvic@[52, 53, 82, 83] | nvic1@[52, 53, 82, 83]
+    [34-35] -> nvicInput142@[0-1]
+    [36-40] -> nvic@[35, 36, 51, 84, 85] | nvic1@[35, 36, 51, 84, 85]
+    41 -> nvicInput86@0
+    [42-44] -> nvic@[119, 76, 100] | nvic1@[119, 76, 100]
+    [47, 48, 50, 52, 53] -> nvic@[93, 138-141] | nvic1@[93, 138-141]
+    54 -> nvic@115 | nvic1@115
+    [55-60] -> nvicInput149@[0-5]
+    [61-64] -> nvic@[5, 95, 96, 142] | nvic1@[5, 95, 96, 142]
+    65 -> nvicInput86@1
+    [66-73] -> nvic@[129-136] | nvic1@[129-136]
+    [74-76] -> nvic@[128, 127, 146] | nvic1@[128, 127, 146]
+    [85, 86] -> nvic@[94, 61] | nvic1@[94, 61]
+
+nvicInput23:
+    -> nvic@23 | nvic1@23
+
+nvicInput40:
+    -> nvic@40 | nvic1@40
+
+nvicInput86:
+    -> nvic@86 | nvic1@86
+
+nvicInput137:
+    -> nvic@137 | nvic1@137
+
+nvicInput142:
+    -> nvic@142 | nvic1@142
+
+nvicInput149:
+    -> nvic@149 | nvic1@149
+
+timer1:
+    BreakInterrupt -> nvic@24 | nvic1@24
+    UpdateInterrupt -> nvic@25 | nvic1@25
+    CaptureCompareInterrupt -> nvic@27 | nvic1@27
+
+// TIM2: the M4's HAL time base (HAL_TIM_PeriodElapsedCallback 0x0810D744 -> HAL_IncTick)
+timer2:
+    -> nvic@28 | nvic1@28
+
+timer4:
+    -> nvic@30 | nvic1@30
+
+timer8:
+    BreakInterrupt -> nvic@43 | nvic1@43
+    UpdateInterrupt -> nvic@44 | nvic1@44
+    CaptureCompareInterrupt -> nvic@46 | nvic1@46
+
+dma1:
+    [0-7] -> nvic@[11-17, 47] | nvic1@[11-17, 47]
+
+adcM1S2:
+    -> nvic@18 | nvic1@18
+
+// HSEM with both cores' interrupt registers and per-core lock ids (sim/PortkitHSEM.cs, include it first)
+hsem: @none
+hsem2: Miscellaneous.PortkitHSEM @ sysbus 0x58026400
+    IRQ1 -> nvic@125
+    IRQ2 -> nvic1@126
+
+// I2C1 0x44 / 0x45 (the firmware's "68" / "69"), addressed by the M4: probably two audio codecs (the micro has a
+// PCM3168A at 0x44; not verified here). Acknowledge everything.
+codec: Mocks.DummyI2CSlave @ i2c1 0x44
+codec2: Mocks.DummyI2CSlave @ i2c1 0x45
+
+// I2C1 0x5d (the firmware's "93"): Goodix GT911 touch controller, as on the micro (sim/PortkitGT911.cs, include it
+// first). Without an answer the M4 retries every ~9 s.
+touch: Input.PortkitGT911 @ i2c1 0x5d
+
+// DMA2 replaced (sim/PortkitAudioDMA.cs, include it first): the audio streams (S1 RAM 0x2407E800 -> SAI1 A,
+// S5 SAI1 B -> 0x2407F800, S7 SAI2 B -> 0x2407F000; 0x200 words each) are circular with half / complete interrupts in
+// the firmware's HAL setup (Renode's STM32DMA drops CIRC/HTIE). One half = 32 frames x 8 slots -> 1500 Hz at 48 kHz.
+// S0 (ADC1 -> 0x30001820) belongs to the M4: all streams go to both NVICs.
+dma2: @none
+audioDma: DMA.PortkitAudioDMA @ sysbus 0x40020400
+    tickHz: 1500
+    [0-7] -> nvic@[56-60, 68-70] | nvic1@[56-60, 68-70]
+
+// SAI1-4 (codecs; SAI4 in D3): registers kept, the status registers (block A +0x18, block B +0x38) report a non-empty
+// FIFO (FLVL = 1, FREQ) so the HAL's DMA start-up wait passes, as for the micro (sim/micro.repl). No audio is moved by
+// them; the DMA model ticks the buffers.
+sai1: Python.PythonPeripheral @ sysbus 0x40015800
+    size: 0x400
+    initable: true
+    script: '''
+if request.IsInit:
+    regs = {}
+elif request.IsRead:
+    if request.Offset in (0x18, 0x38):
+        request.Value = 0x00010008
+    else:
+        request.Value = regs.get(request.Offset, 0)
+else:
+    regs[request.Offset] = request.Value
+'''
+
+sai2: Python.PythonPeripheral @ sysbus 0x40015C00
+    size: 0x400
+    initable: true
+    script: '''
+if request.IsInit:
+    regs = {}
+elif request.IsRead:
+    if request.Offset in (0x18, 0x38):
+        request.Value = 0x00010008
+    else:
+        request.Value = regs.get(request.Offset, 0)
+else:
+    regs[request.Offset] = request.Value
+'''
+
+sai3: Python.PythonPeripheral @ sysbus 0x40016000
+    size: 0x400
+    initable: true
+    script: '''
+if request.IsInit:
+    regs = {}
+elif request.IsRead:
+    if request.Offset in (0x18, 0x38):
+        request.Value = 0x00010008
+    else:
+        request.Value = regs.get(request.Offset, 0)
+else:
+    regs[request.Offset] = request.Value
+'''
+
+sai4: Python.PythonPeripheral @ sysbus 0x58005400
+    size: 0x400
+    initable: true
+    script: '''
+if request.IsInit:
+    regs = {}
+elif request.IsRead:
+    if request.Offset in (0x18, 0x38):
+        request.Value = 0x00010008
+    else:
+        request.Value = regs.get(request.Offset, 0)
+else:
+    regs[request.Offset] = request.Value
+'''
+
+// D2 SRAM1-3 are also mapped at 0x10000000 (alias); the M7 reaches the M4 -> M7 queue through it (pointer
+// 0x24009F58 = 0x10040000, read by 0x0804BEB0 in the audio callback), the M4 writes it at 0x30040000.
+sram1: @ {
+        sysbus 0x30000000;
+        sysbus 0x10000000
+    }
+sram2: @ {
+        sysbus 0x30020000;
+        sysbus 0x10020000
+    }
+sram3: @ {
+        sysbus 0x30040000;
+        sysbus 0x10040000
+    }

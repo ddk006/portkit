@@ -1,0 +1,8 @@
+# Virtual SD card for the bluebox (M4 = cpu1): the five sd_diskio functions of SD_Driver (0x0814B134, linked by
+# SDMgrCM4 0x08104E7C) served from an image file by sim/sdhook.py. $simdir / $sdimg are substituted by bluebox_run.py.
+python "import sys; sys.path.append('$simdir'); import sdhook; sdhook.open_image('$sdimg')"
+cpu1 AddHook 0x08104BB8 "import sdhook; sdhook.init(self)"
+cpu1 AddHook 0x08104D90 "import sdhook; sdhook.status(self)"
+cpu1 AddHook 0x08104C50 "import sdhook; sdhook.read(self)"
+cpu1 AddHook 0x08104CC4 "import sdhook; sdhook.write(self)"
+cpu1 AddHook 0x08104D38 "import sdhook; sdhook.ioctl(self)"
