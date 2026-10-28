@@ -220,6 +220,39 @@ aufnehmen und von SD abspielen, Ausblenden mit Filter. Projektwechsel (= "Preset
   - Renode (frische Karte, 120 BPM, BARS 1, 440-Hz-Eingang, REC bei Tick ~1690, Eingang ab 4,4 s still): WAV
     958200 Byte (24 Bit stereo), Take-Ende 7920, Loop ab Taktlinie 3840 mit 95968/96000 Samples, Ausgang ab Take-Ende
     durchgehend 0,70 (Loop), Kopfzeile ohne Fehler.
+- **Looper L8, unabhängig vom Spur-Recorder (2026-10-28, emu):** Rückmeldung zu L7 am Gerät (Kyrill, 2026-10-27):
+  bootet und nimmt auf; Regler ohne Werte und zu schnell, kein Status sichtbar, Loop an den Recorder gebunden.
+  Gewünscht: Quelle = Ausgang der Spur, Start an der nächsten Taktlinie, Datei auf SD (RAM frei halten), Aufnahme von
+  Spuren / Master muss weiterlaufen, Loop darf auf der Master-Aufnahme hörbar sein, Pegel wie die Spur.
+  - Stream-Cache (Objekt 0x10044270, vtable 0x08076BD4): [0] write(cache, asset, l, r, n) 0x0805AD08 (schreibt an
+    die Schreibposition des Assets, Slot +0x1B18; Aufrufer bei der Aufnahme: Mixer `b988` über 0x0805012C);
+    [2] read 0x0805B350; [4] 0x0805B7BC -> 0x0805B210(cache, asset, block): Block-Anforderung an den M4 (Ring
+    +0x2B0C, 128 Einträge {Block, Typ 4, Asset}; fordert Block b..b+3 an, berührt nur den LRU-Zähler, wenn der Block
+    schon in der Tabelle steht); [5] **length(int64 *out, cache, asset)** 0x0805AC88 (Ergebnis über das erste
+    Argument!). Blocktabelle je Datei: Zeiger bei cache + 0x352C + 4 * Datei-Slot, u16-Einträge (b + 0x400 für
+    b < 32, sonst b & 0x3FF); Deskriptoren zu 24 Byte bei cache + 24 * e: +4 Float-Daten, +8 Block, +0x10 Samples,
+    +0x14 Asset, +0x16 rechter Kanal, +0x18 in Benutzung, +0x19 wird geladen. Blockgröße 0x9800 Samples je Kanal.
+    Die Stock-Leseroutine kopiert ohne Prüfung des Datenzeigers.
+  - M4-Stream-Manager (Objekt 0x3000B778, erstes Wort = Cache): Aufträge über 0x0810A630 (Kommando 8 - Typ: 7 =
+    Datei lesen, Handler 0x0810B9E4), 0x0810A840 (10 - Arg5: 9 = Datei schreiben, Handler 0x0810B8F6, gibt das Asset
+    vorher frei 0x0810B8B0), 0x0810A8FC (12 = schließen, Handler 0x0810B380: Header, Länge 0x0810C608 in den
+    Cache), 0x0810A6E8 (29 = Datei kopieren/umbenennen), Verteiler 0x0810BC0C. Stock-Take (Spur): beim Scharfschalten
+    openW(asset, "Projects\<Projekt>\01-1-00000.wav", 2), ab REC M7-Writes, bei STOP close + openR, dann openW
+    des nächsten Takes.
+  - Mixer-Kanalpfad 0x0805012C (für Kanäle mit Aufnahme-Flags) ruft den Cache über seine vtable auf.
+  - Fehler, die die Simulation gezeigt hat (alle behoben): (1) 1 KB Stack-Rahmen in `loop_process` (läuft je Spur im
+    Audio-Interrupt) überschrieb Firmware-Daten, eine Stock-FFT las danach aus den Ethernet-Registern -> Arbeitspuffer
+    in SRAM4 0x38008000. (2) Längenabfrage als length(cache, asset) aufgerufen: schrieb -1 / die Länge über den
+    vtable-Zeiger und Deskriptor 0 des Caches -> scheinbar kaputter Block 0 (Daten -1, Absturz der Stock-Leseroutine
+    beim Sprung zum Loop-Anfang) und Absturz im Mixer-Aufnahmepfad, sobald der Transport aufnahm (vtable-Watchpoint:
+    Schreiber 0x0805AC98, aus `loop_process`). Ein zwischenzeitlicher Versuch, den "verwaisten" Deskriptor 0
+    freizugeben, legte das ganze Audio lahm (er war nur von (2) überschrieben).
+  - Renode L8 (frische Karte, 120 BPM, BARS 1): LOOP bei Tick 1460, Aufnahme ab 3840, close 7764, Loop ab 7790
+    durchgehend 0,70 am Ausgang; dasselbe, während Spur 3 per REC aufnimmt (Take geschrieben, Loop hörbar).
+    Eine Spur, die selbst scharf geschaltet ist und aufnimmt, gibt den Loop nicht aus (anderer Signalweg, offen).
+  - Regler: Typ-1-Regler (ganze Zahl) bewegen sich einen Wert je Encoder-Zähler (0x0812877C: Wert = min + Position),
+    VOL braucht ~2000 Zähler; eigene Schritte (BARS / FADE 96 Zähler, FILTER 1 % je 8). Die Stock-Drehung bewegte
+    FILTER (Typ 9) in der Simulation nicht. Werte in den Beschriftungen (snprintf 0x08146156).
 - RAM-Rechnung: frei ~6,4 MB (1,5 + 4,9). 24 Bit mono 3 MB je Slot = 21,8 s (16 Takte nur ab ~176 BPM),
   stereo 10,9 s. Daher SD.
 - Einhängepunkt: noch offen; Kandidaten sind die Kanalkette (Bus 0..11 vor dem Mixer `b988`) oder der Mixer selbst.

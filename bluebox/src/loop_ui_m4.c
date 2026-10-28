@@ -24,6 +24,7 @@
  * Widgets and state live in SRAM4 (0x3800A000.., unused by the stock firmware; the M7 state is at 0x3800F000).
  */
 #include <stdint.h>
+#include "loop_shared.h"
 
 typedef void (*ctor_fn)(void *w);
 typedef void (*rect_fn)(void *w, int *rect);
@@ -47,6 +48,7 @@ typedef void (*hide_fn)(void *w, int hidden);
 #define fw_show      ((void (*)(void *, void *))FN(0x0813aa1c))
 #define fw_setblock  ((void (*)(void *, int))FN(0x08133884))
 #define fw_page_msg  ((void (*)(void *, void *))FN(0x081342ac))
+#define fw_post      ((void (*)(void *, void *))FN(0x0813ba64))   /* a message up the widget's parent chain */
 #define STORE ((void *)0x30018010)
 
 #define P_LOOP 0x103
@@ -72,6 +74,9 @@ struct loop_ui {
     uint8_t saved[N_KNOB + N_BTN];          /* stock hidden flags while the Loop view shows */
     uint8_t _p[1];
     void *pm, *page;
+    int32_t acc[UI_KNOBS];                  /* encoder counts not yet turned into a step */
+    char text[16];                          /* the LOOP button's text as shown */
+    uint8_t lit;
     uint8_t knob[UI_KNOBS][KNOB_SIZE];      /* FILTER, BARS, FADE (encoders 1, 2, 3) */
     uint8_t btn[BTN_SIZE];                  /* LOOP */
     uint32_t btn_vt[18];                    /* the button's vtable: the stock one with our tap method */
@@ -112,29 +117,18 @@ static void redraw(void)
     }
 }
 
-/* The stock button sends its parameter itself only with flag +0xFC set, and that flag also inverts the display (lit =
- * value 0). Ours keeps +0xFC = 0 (lit = on) and gets a copy of the button vtable whose tap method (slot 6,
- * 0x081280EC: toggles the state +0x96) is followed by our own 0x6E message: track +0xF8, id +0xFA, the new state. */
+/* The LOOP button: the stock tap (vtable slot 6, 0x081280EC) toggles its lit state +0x96; ours (a copy of the button
+ * vtable with this tap) hands the key to the M7 instead (cmd[track] in the shared state, src/loop_shared.h) and lets
+ * loop_tick show the slot's state. */
 #define BTN_VT 0x0814d9c4
-#define fw_btn_tap ((void (*)(void *, int, int))FN(0x081280ec))
-#define fw_post ((void (*)(void *, void *))FN(0x0813ba64))
 static void loop_btn_tap(void *w, int a, int b)
 {
+    (void)a;
+    (void)b;
     uint8_t *btn = w;
-    uint8_t before = btn[0x96];
-    fw_btn_tap(w, a, b);
-    if (btn[0x96] == before)
-        return;                             /* not a toggle (disabled, ...) */
-    struct { uint16_t code, _p; uint32_t sender; uint16_t track, _p1; uint32_t id; int32_t value; uint32_t _p2; } m;
-    m.code = 0x6e;
-    m._p = 0;
-    m.sender = 0x0814b0f0;                  /* as the stock senders (literal 0x08128154) */
-    m.track = *(uint16_t *)(btn + 0xf8);
-    m._p1 = 0;
-    m.id = *(uint16_t *)(btn + 0xfa);
-    m.value = btn[0x96];
-    m._p2 = 0;
-    fw_post(w, &m);
+    unsigned track = *(uint16_t *)(btn + 0xf8);
+    if (track < LOOP_TRACKS)
+        LOOP_SHARED->cmd[track] = 1;
 }
 
 /* after the Track page's constructor (bl @0x08135BA2): build our widgets, hidden */
@@ -157,6 +151,7 @@ void loop_ui_build(void *page)
     u->page = page;
     for (int i = 0; i < UI_KNOBS; i++) {
         uint8_t *k = u->knob[i];
+        u->acc[i] = 0;
         fw_knob_ctor(k);
         fw_add_child(page, k);
         fw_strncpy((char *)k + 0xf8, KLBL[i], 0xff);
@@ -172,7 +167,7 @@ void loop_ui_build(void *page)
     b[0x88] = 8;
     b[0xf4] = 8;
     *(uint16_t *)(b + 0xfa) = P_LOOP;
-    b[0xfc] = 0;                            /* lit = on; loop_btn_tap sends the value */
+    b[0xfc] = 0;                            /* lit = busy; loop_btn_tap hands the key to the M7 */
     for (int i = 0; i < 18; i++)
         u->btn_vt[i] = ((const uint32_t *)BTN_VT)[i];
     u->btn_vt[6] = (uint32_t)loop_btn_tap | 1u;
@@ -180,7 +175,69 @@ void loop_ui_build(void *page)
     fw_btn_style(b, 0x15);                  /* as REC: lit when on */
     rect(b, BRECT);
     hide(b, 1);
+    u->text[0] = 0;
+    u->lit = 0xff;
     u->built = 1;
+}
+
+/* Values in the knob labels ("BARS 4", "LP 35%"): the stock knobs show only their label here.
+ * Speed: a type-1 knob (whole number) moves one value per encoder count (0x0812877C: value = min + position), so BARS
+ * (1..16) and FADE (0..16) went through their range ~100 times faster than VOL (~2000 counts). They are stepped here,
+ * one value per STEP_COUNTS counts without the stock acceleration. FILTER: 1 % per FILTER_COUNTS counts (the stock
+ * turn did not move it in the simulation). */
+#define fw_snprintf ((int (*)(char *, unsigned, const char *, ...))FN(0x08146156))
+#define STEP_COUNTS 96
+#define FILTER_COUNTS 8
+
+static void label(uint8_t *k, int i, int32_t v)
+{
+    char *l = (char *)k + 0xf8;
+    if (KID[i] == P_FILTER)
+        fw_snprintf(l, 16, v < 0 ? "LP %d%%" : v > 0 ? "HP %d%%" : "FILTER", (v < 0 ? -v : v) / 10);
+    else if (KID[i] == P_FADE && v == 0)
+        fw_snprintf(l, 16, "FADE OFF");
+    else
+        fw_snprintf(l, 16, "%s %d", KLBL[i], (int)v);
+    fw_knob_lbl(k, 1);
+}
+
+static void set_value(int i, uint16_t track, int32_t v)
+{
+    uint8_t *k = UI->knob[i];
+    struct { uint16_t code, _p; uint32_t sender; uint16_t track, _p1; uint32_t id; int32_t value; uint32_t _p2; } m;
+    fw_bind(k, KID[i], v, 0);
+    m.code = 0x6e;
+    m._p = 0;
+    m.sender = 0x0814b0f0;
+    m.track = track;
+    m._p1 = 0;
+    m.id = KID[i];
+    m.value = v;
+    m._p2 = 0;
+    fw_post(k, &m);
+    label(k, i, v);
+}
+
+static void turn(void *page, int i, int32_t delta)
+{
+    struct loop_ui *u = UI;
+    uint16_t track = *(uint16_t *)((uint8_t *)page + PG_TRACK), t = track, id = KID[i];
+    int32_t v = 0;
+    fw_get(STORE, &t, &id, &v);
+    int32_t lo = KID[i] == P_BARS ? 1 : KID[i] == P_FILTER ? -1000 : 0, hi = KID[i] == P_FILTER ? 1000 : 16;
+    int32_t per = KID[i] == P_FILTER ? FILTER_COUNTS : STEP_COUNTS, unit = KID[i] == P_FILTER ? 10 : 1;
+    if ((u->acc[i] > 0 && delta < 0) || (u->acc[i] < 0 && delta > 0))
+        u->acc[i] = 0;                      /* direction changed: start counting again */
+    u->acc[i] += delta;
+    int32_t steps = u->acc[i] / per;
+    if (!steps)
+        return;
+    u->acc[i] -= steps * per;
+    int32_t n = v + steps * unit;
+    n = n < lo ? lo : n > hi ? hi : n;
+    if (n != v)
+        set_value(i, track, n);
+    redraw();
 }
 
 /* values of the page's track into our widgets */
@@ -197,6 +254,7 @@ static void refresh(void *page)
         if (*(uint16_t *)(k + 0x94) != id)
             fw_setparam(k, id, v);          /* first time: type, range and label from the parameter table */
         fw_bind(k, id, v, 0);
+        label(k, i, v);
         uint8_t txt[0x70];                  /* the stock update prepares its text buffer like this */
         txt[0] = 1;
         txt[2] = 0;
@@ -206,11 +264,8 @@ static void refresh(void *page)
         fw_fmt(STORE, &t, id, txt);
         fw_text(k, txt);
     }
-    uint16_t t = track, id = P_LOOP;
-    int32_t on = 0;
-    fw_get(STORE, &t, &id, &on);
     *(uint16_t *)(u->btn + 0xf8) = track;
-    fw_btn_on(u->btn, on != 0);
+    u->lit = 0xff;                          /* loop_tick shows the track's slot */
 }
 
 /* hide the stock widgets and show ours, or the other way round */
@@ -295,10 +350,8 @@ void loop_msg(void *page, void *msg)
     uint16_t code = *(uint16_t *)msg;
     if (u->built && u->view && page == u->page && code == 0x32) {
         int enc = *(int16_t *)((uint8_t *)msg + 0x0c), delta = *(int32_t *)((uint8_t *)msg + 0x10);
-        if (enc >= 0 && enc < UI_KNOBS) {
-            fw_turn(u->knob[enc], (int16_t)delta);
-            redraw();
-        }
+        if (enc >= 0 && enc < UI_KNOBS)
+            turn(page, enc, delta);
         return;
     }
     fw_page_msg(page, msg);
@@ -309,127 +362,97 @@ void loop_msg(void *page, void *msg)
     }
 }
 
-/* ---- recording that stops after BARS bars ----
- * The REC key reaches the app as message 0x69 (STOP 0x6C); the app hands codes below 0x7B to the page manager
- * (bl 0x0813AA90 @0x08135B24). loop_app_msg looks at REC first: if a track has Rec Enable (0x162) and LOOP on, the
- * recording is to end BARS bars (+ a 16th for the loop crossfade) after the next bar line (at least a 16th ahead). The
- * stock recorder starts at once as usual; the M7 loops from that bar line (src/loop_m7.c, autostart). Rec Enable of
- * those tracks is switched off with the take: the player does not play clips while it is set (0x162 -> player +0x96,
- * render branch @0x08057CA4), so the loop would stay silent.
- * The transport's Punch In / Out are not used: applying them via 0x08126524 while the transport runs made the recorder
- * register a take without writing its file (simulation: no WAV on the card, take start at the REC press).
- * Transport position: ticks (960 PPQ) published by the M7 at 0x300478B0. */
-#define fw_pm_msg ((void (*)(void *, void *))FN(0x0813aa90))
-#define TICKS (*(volatile int32_t *)0x300478b0)
-#define P_RECEN 0x162
-#define BAR 3840
-#define SIXTEENTH 240
-
-struct rec_state {
-    uint32_t magic;
-    uint32_t pending;                       /* a loop recording runs: finish its take at out */
-    int32_t out;                            /* ticks */
-    uint32_t tracks;                        /* bit n: track n records into a loop (Rec Enable and LOOP) */
-    int32_t err_until;                      /* ticks: end of the window after the take (see loop_tick) */
-    uint32_t err0;                          /* stream error count before the take ended */
-};
-#define RS ((struct rec_state *)0x3800EF00u)
-#define RS_MAGIC 0x43455250u                 /* "PREC" */
-
-static int32_t pget(unsigned set, unsigned id)
-{
-    uint16_t t = (uint16_t)set, i = (uint16_t)id;
-    int32_t v = 0;
-    fw_get(STORE, &t, &i, &v);
-    return v;
-}
-
-static void rec_for_loop(void)
-{
-    int bars = 0;
-    uint32_t tracks = 0;
-    for (unsigned tr = 0; tr < 12; tr++)
-        if (pget(tr, P_RECEN) && pget(tr, P_LOOP)) {
-            if (!bars)
-                bars = pget(tr, P_BARS);    /* the first such track sets the length */
-            tracks |= 1u << tr;
-        }
-    RS->magic = RS_MAGIC;
-    RS->pending = 0;
-    RS->tracks = tracks;
-    RS->err_until = 0;
-    if (bars <= 0)
-        return;                             /* a normal recording */
-    if (bars > 16)
-        bars = 16;
-    int32_t now = TICKS, in = (now / BAR + 1) * BAR;
-    if (in - now < SIXTEENTH)
-        in += BAR;
-    RS->out = in + bars * BAR + SIXTEENTH;
-    RS->pending = 1;
-}
-
-/* The stock finishes a take only at STOP (0x081272CC(store, 0) = record off: with a take running, flag store + 0x743B,
- * 0x08127150 sets its end, queues closing the file and sends the clip to the M7 via 0x08125040; the transport is not
- * touched, STOP stops it separately). So the new clip would not exist while the transport runs on. loop_tick, on the UI
- * loop's redraw check (bl 0x0813AA9E @0x081351A6), switches record off once the transport is past out; the M7 then
- * starts the clip at once (src/loop_m7.c, autostart). */
+/* ---- the loop files and the state on the LOOP button ----
+ * The M7 asks for its files in slot.req (src/loop_shared.h); loop_tick (on the UI loop's redraw check,
+ * bl 0x0813AA9E @0x081351A6) queues them at the M4 stream manager (object 0x3000B778) as the stock recorder does
+ * (simulation trace of a stock take): open for writing 0x0810A840(sm, asset, path, channels 2, 1) (command 9, when
+ * a track is armed), close 0x0810A8FC(sm, asset) (command 12: header, length into the cache), open for reading
+ * 0x0810A630(sm, asset, path, 1, 1) (command 7). Opening an asset for writing first releases whatever it had open
+ * (0x0810B8B0). Files: LOOPA0.WAV / LOOPA1.WAV (slot 1), LOOPB0.WAV / LOOPB1.WAV (slot 2) in the card's root,
+ * 24-bit stereo; each recording overwrites the older file of its slot. */
+#define SM ((void *)0x3000b778)
+#define fw_open_w ((void (*)(void *, unsigned, const char *, unsigned, unsigned))FN(0x0810a840))
+#define fw_close ((void (*)(void *, unsigned))FN(0x0810a8fc))
+#define fw_open_r ((void (*)(void *, unsigned, const char *, unsigned, unsigned))FN(0x0810a630))
 #define fw_redraw ((int (*)(void *, void *))FN(0x0813aa9e))
-#define fw_setrec ((void (*)(void *, int))FN(0x081272cc))
-#define TAKE_RUNNING (*(volatile uint8_t *)((uint8_t *)STORE + 0x743b))
-/* Stream errors shown in the header (0x08122C08 -> "ERROR %d" / "REC ERROR"): the cache's count at +0x362C plus a
- * second one. Finishing a take while the transport runs makes the Mixer node (0x08050564, which reads the recording
- * track at the write position) miss about 8 ticks of reads while the M4 streamer registers the file again (simulation:
- * 7 errors at ticks 8024..8032 after a take ending at 7920; the stock finishes takes only at STOP, so it has none).
- * Those are counted back for an 8th note after the take; errors outside that window stay. */
-#define STREAM_ERRS (*(volatile uint32_t *)(0x30044270u + 0x362c))
-#define ERR_WINDOW 480
-#define fw_store_msg ((void (*)(void *, void *))FN(0x08126e8c))   /* where the UI's 0x6E messages end (0x0813A9C8) */
 
-static void pset(unsigned track, unsigned id, int32_t value)
+static const char *const PATH[LOOP_SLOTS][2] = { { "LOOPA0.WAV", "LOOPA1.WAV" }, { "LOOPB0.WAV", "LOOPB1.WAV" } };
+
+static void files(void)
 {
-    struct { uint16_t code, _p; uint32_t sender; uint16_t track, _p1; uint32_t id; int32_t value; uint32_t _p2; } m;
-    m.code = 0x6e;
-    m._p = 0;
-    m.sender = 0x0814b0f0;
-    m.track = (uint16_t)track;
-    m._p1 = 0;
-    m.id = id;
-    m.value = value;
-    m._p2 = 0;
-    fw_store_msg(STORE, &m);
+    volatile struct loop_shared *s = LOOP_SHARED;
+    if (s->magic != LOOP_MAGIC)
+        return;
+    for (unsigned i = 0; i < LOOP_SLOTS; i++) {
+        volatile struct loop_slot *sl = &s->slot[i];
+        unsigned req = sl->req, asset = sl->asset;
+        const char *path = PATH[i][sl->gen & 1];
+        if (req == REQ_OPEN_W)
+            fw_open_w(SM, asset, path, 2, 1);
+        else if (req == REQ_CLOSE) {
+            fw_close(SM, asset);
+            fw_open_r(SM, asset, path, 1, 1);
+        } else if (req == REQ_CANCEL)
+            fw_close(SM, asset);
+        if (req != REQ_NONE)
+            sl->req = REQ_NONE;
+    }
+}
+
+/* the LOOP button shows the track's slot: LOOP / ARMED / REC 2/4 / WAIT / PLAY 3/4 / FADE (lit while busy) */
+static void status(void)
+{
+    struct loop_ui *u = UI;
+    if (!u->built || !u->view || !u->page)
+        return;
+    volatile struct loop_shared *s = LOOP_SHARED;
+    unsigned track = *(uint16_t *)((uint8_t *)u->page + PG_TRACK);
+    char txt[16];
+    int lit = 0;
+    fw_snprintf(txt, sizeof txt, "LOOP");
+    if (s->magic == LOOP_MAGIC)
+        for (unsigned i = 0; i < LOOP_SLOTS; i++) {
+            volatile struct loop_slot *sl = &s->slot[i];
+            if (sl->state == LS_IDLE || sl->track != track)
+                continue;
+            unsigned bars = sl->bars ? sl->bars : 1;
+            uint32_t len = (uint32_t)(sl->lenq >> 16), bar = len / bars ? len / bars : 1;
+            lit = 1;
+            if (sl->state == LS_ARMED)
+                fw_snprintf(txt, sizeof txt, "ARMED");
+            else if (sl->state == LS_REC) {
+                unsigned b = (unsigned)(sl->written - sl->start) / bar + 1;
+                fw_snprintf(txt, sizeof txt, "REC %u/%u", b > bars ? bars : b, bars);
+            } else if (sl->state == LS_CLOSING)
+                fw_snprintf(txt, sizeof txt, "WAIT");
+            else if (sl->state == LS_PLAY) {
+                unsigned b = (uint32_t)(sl->posq >> 16) / bar + 1;
+                fw_snprintf(txt, sizeof txt, "PLAY %u/%u", b > bars ? bars : b, bars);
+            } else {
+                fw_snprintf(txt, sizeof txt, "FADE");
+                continue;                   /* a fading loop: an armed / new one of the track wins */
+            }
+            break;
+        }
+    int changed = lit != u->lit;
+    for (unsigned i = 0; i < sizeof txt && !changed; i++) {
+        changed = txt[i] != u->text[i];
+        if (!txt[i])
+            break;
+    }
+    if (!changed)
+        return;
+    for (unsigned i = 0; i < sizeof txt; i++)
+        u->text[i] = txt[i];
+    u->lit = (uint8_t)lit;
+    fw_btn_label(u->btn, u->text);
+    fw_btn_on(u->btn, lit);
+    redraw();
 }
 
 int loop_tick(void *pm, void *arg)
 {
-    if (RS->magic == RS_MAGIC && RS->pending) {
-        if (!TAKE_RUNNING) {
-            if (TICKS >= RS->out)
-                RS->pending = 0;            /* stopped or finished another way */
-        } else if (TICKS >= RS->out) {
-            RS->pending = 0;
-            RS->err0 = STREAM_ERRS;
-            RS->err_until = TICKS + ERR_WINDOW;
-            fw_setrec(STORE, 0);
-            for (unsigned tr = 0; tr < 12; tr++)
-                if (RS->tracks >> tr & 1)
-                    pset(tr, P_RECEN, 0);
-        }
-    }
-    if (RS->magic == RS_MAGIC && RS->err_until) {
-        if (TICKS < RS->err_until && TICKS >= RS->err_until - ERR_WINDOW - BAR) {
-            if (STREAM_ERRS > RS->err0)
-                STREAM_ERRS = RS->err0;
-        } else
-            RS->err_until = 0;
-    }
+    files();
+    status();
     return fw_redraw(pm, arg);
-}
-
-void loop_app_msg(void *pm, void *msg)
-{
-    uint16_t code = *(uint16_t *)msg;
-    if (code == 0x69)
-        rec_for_loop();
-    fw_pm_msg(pm, msg);
 }

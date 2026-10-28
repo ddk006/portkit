@@ -1,237 +1,89 @@
 /*
- * Looper prototype, M7 side: a clip on a track repeats instead of ending.
- * bluebox eurorack 1.5.1 (re/bluebox.md, "Track-Player").
+ * Looper, M7 side: records a track's output into its own file on the SD card and loops it (src/loop_shared.h).
+ * bluebox eurorack 1.5.1 (re/bluebox.md).
  *
- * The track player (channel node vtable 0x0806BF74, player 0x08057B78) renders each clip as a voice through
- * FUN_08057A00(player, voice, bus, a3). Voice (0x38 bytes): +0x00 active, +0x01 ending (fading out), +0x04 asset id,
- * +0x08 int64 read position in the WAV (samples), +0x18 int64 start delay, +0x20 int64 samples left in the clip.
- * When the samples left drop below one, the stock code fades the voice out and starts the player's next clip.
- *
- * loop_voice replaces the three calls of FUN_08057A00 (0x08057D1E, 0x08057EF8, 0x08057F06). For a looping track it
- * fixes the loop region at the first block it sees of a voice:
- *   - bars = 0: the whole clip;
- *   - bars = 1..16: from the first bar line at or after the point where the clip plays on the timeline, `bars` bars
- *     long (4/4: 3840 ticks a bar, 960 PPQ), in samples at the current tempo; fewer bars if the clip is too short
- *     (whole clip if not even one fits with XF samples to spare).
- * The fourth argument a3 points to the transport pointer (as passed on to the voice start 0x0805779C): transport
- * +0x18 float tempo (BPM), +0x30 int64 position in ticks; samples = ticks / 960 / bpm * 60 * 48000 (0x0805AB80).
- * When a block would reach the loop end, the samples left get one loop length added first (so the stock code doesn't
- * end the clip); after the block the read position moves back by that length. left = clip end - pos holds throughout.
- * A bar is rarely a whole number of samples: the jump lengths come from a 48.16 fixed-point accumulator, so over many
- * passes the loop stays on the transport's bar grid (no drift). Tempo changes while looping are not followed yet.
- *
- * The jump happens at a block boundary (32 frames): the last block of a pass reads up to 31 samples past the clip end,
- * the next pass starts at the matching offset. The click there is removed by a crossfade in the cache read:
- * loop_read replaces the stream cache's read (vtable 0x08076BD4 slot 2, 0x0805B350(this, fn, int64 pos, asset,
- * float *l, float *r, count), returns != 0 on success; the voice's only call is 0x08057A92). After a jump, reads in
- * [start, start + XF) are mixed from the head x(p) fading in and the continuation past the loop end x(p + len) fading
- * out (equal power). The pass before the jump played up to that continuation, so the signal stays continuous; the
- * recording should run at least XF samples past the loop end. If the file ends at the loop end, the stock read fails
- * for the block that reaches past it; loop_read then reads the part up to the loop end and pads with silence, and the
- * head fades in from silence after the jump (a step at the loop end remains: the looper records past the end).
- *
- * Which tracks loop: the channel parameters LOOP (0x103) and BARS (0x104, 1..16; src/loop_m4.c) arrive in each track's
- * queue. loop_process wraps the track player node's process (vtable 0x0806BF74 slot 3, 0x080574EC(obj, ctx)) and picks
- * them up (event type 0x39, target queue +8 = the node's queue id +0x18 = the track, id +0x0C, value +0x10). Two loop
- * slots: tracks get one in the order they switch LOOP on; a third track with LOOP on waits and gets the next slot
- * that frees up. LOOP off ends the looping clip with the stock fade (its samples left are cut to this block). A debug mask
- * (state +4) makes tracks loop regardless (tests); BARS from the track, else the state's global `bars`.
- *
- * State: SRAM4 0x3800F000 (unused by the stock firmware: re/bluebox.md, canary check in the simulation).
+ * Where: the channel chain is player 0x0806BFDC -> EQ 0x0806AD18 -> node 0x0806BF74 -> ... -> mixer 0x0806B988
+ * (fader, pan, sends). loop_process replaces the process of node 0x0806BF74 (vtable slot 3, 0x080574EC(obj, ctx)):
+ * the track's bus there holds its input and clips after the EQ. Per block it
+ *   - takes the track's channel parameters BARS (0x104), FILTER (0x105), FADE (0x107) from the track's queue
+ *     (event type 0x39, target +8 = the node's queue id +0x18 = the track, id +0x0C, value +0x10);
+ *   - writes the bus to the slot's file while recording (before the loop is added, so a new recording of a track
+ *     never contains its own old loop);
+ *   - adds the slot's loop (filter, fade) to the bus;
+ *   - then runs the stock process.
+ * Bus: 0x08053CD4(ctx, port +0x1E) -> bus; frames 0x0804D4C0(bus); stereo buffers 0x0804D598(bus, &l, &r) (as the
+ * stock recorder and voices: clears a bus marked empty, makes a mono bus stereo).
+ * Transport: *ctx: +0x18 float tempo, +0x30 int64 position in ticks (960 PPQ, 4/4: 3840 ticks a bar).
+ * Stream cache (object 0x10044270, vtable 0x08076BD4): [0] write(cache, asset, l, r, n) 0x0805AD08 writes at the
+ * asset's write position; [2] read(cache, -, int64 pos, asset, l, r, n) 0x0805B350, != 0 = ok; [5] length(cache,
+ * asset) 0x0805AC88 as length(int64 *out, cache, asset) (the result goes through the first argument: called as
+ * length(cache, asset) it wrote over the cache object's vtable pointer), -1 = unknown; asset map u16 at
+ * +0x2708 + 2 asset, 0xFFFF = no file. The M4 opens
+ * and closes the files (requests in the shared state).
  */
 #include <stdint.h>
+#include "loop_shared.h"
 
 #define FN(a) ((a) | 1u)
-typedef void (*voice_fn)(void *player, void *voice, void *bus, uint32_t a3);
-typedef unsigned (*frames_fn)(void *bus);
-typedef int (*read_fn)(void *cache, void *fn, int64_t pos, uint32_t asset, float *l, float *r, int n);
 typedef int (*process_fn)(void *obj, void *ctx);
-typedef void *(*queue_fn)(void *ctx, unsigned id);
-typedef int (*event_fn)(void *queue, unsigned index, void *event);
-#define fw_voice  ((voice_fn)FN(0x08057a00))
-#define fw_frames ((frames_fn)FN(0x0804d4c0))
-#define fw_read   ((read_fn)FN(0x0805b350))
-#define fw_player ((process_fn)FN(0x080574ec))
-#define fw_queue  ((queue_fn)FN(0x08053c8c))
-#define fw_next_ev ((event_fn)FN(0x0804e938))
-#define P_LOOP 0x103
+#define fw_stock_proc ((process_fn)FN(0x080574ec))
+#define fw_queue  ((void *(*)(void *, unsigned))FN(0x08053c8c))
+#define fw_next_ev ((int (*)(void *, unsigned, void *))FN(0x0804e938))
+#define fw_bus    ((void *(*)(void *, unsigned))FN(0x08053cd4))
+#define fw_frames ((unsigned (*)(void *))FN(0x0804d4c0))
+#define fw_stereo ((void (*)(void *, float **, float **))FN(0x0804d598))
+#define fw_cwrite ((int (*)(void *, uint32_t, float *, float *, int))FN(0x0805ad08))
+#define fw_clen   ((void (*)(int64_t *, void *, uint32_t))FN(0x0805ac88))   /* length(&out, cache, asset) */
+#define CACHE ((void *)0x10044270u)
+#define CACHE_MAP(a) (*(volatile uint16_t *)((uint8_t *)CACHE + 0x2708 + 2 * (a)))
+#define fw_creq   ((void (*)(void *, uint32_t, uint32_t))FN(0x0805b210))
+#define BLOCK 0x9800              /* samples per cache block (per channel) */
+
 #define P_BARS 0x104
 #define P_FILTER 0x105            /* -1000..1000: < 0 low-pass, > 0 high-pass, 0 off */
-#define P_FADE 0x107              /* bars the loop takes to fade out when LOOP goes off, 0 = at once */
-#define TRACKS 12
-#define LOOP_SLOTS 2              /* loops at once; more would work the same way (SD bandwidth: not measured) */
+#define P_FADE 0x107              /* bars the loop takes to fade out, 0 = a short ramp */
+#define P_QUEUE 0x18              /* the node's queue id = its channel */
+#define P_PORT 0x1e
+#define T_BPM 0x18
+#define T_POS 0x30
+#define BAR_TICKS 3840
+#define MAX_BARS 16
+#define XF 256                    /* crossfade at the loop point, samples (5.3 ms) */
+#define MAXN 64                   /* largest block handled (the engine runs 32) */
 
 struct fw_ev { uint8_t type, _p0[7]; uint32_t dest; uint16_t id, _p1; int32_t value; uint32_t _p2; };
-#define XF 256                    /* crossfade at the loop point, samples (5.3 ms at 48 kHz) */
-#define MAXN 64                   /* largest read we blend (the voice reads one block of 32) */
 
-struct voice {
-    uint8_t active, ending, _p[2];
-    uint32_t asset;
-    int64_t pos;
-    uint32_t _p1[2];
-    int64_t delay;
-    int64_t left;
-};
+/* Work buffers in SRAM4, not on the stack: loop_process runs for every track in the audio interrupt, and a frame of
+ * ~1 KB there overran the stack in the simulation (it corrupted a stock analysis object, whose FFT then read from the
+ * Ethernet registers). The cave has no RAM of its own (code only). */
+struct work { float ll[MAXN], rr[MAXN], tl[MAXN], tr[MAXN]; };
+#define WORK ((struct work *)0x38008000u)
+_Static_assert(sizeof(struct work) <= 0x2000, "SRAM4 0x38008000..0x3800A000 (the M4 UI starts at 0x3800A000)");
 
-#define SLOTS 32                  /* voices tracked at once (12 tracks x up to 3 voices) */
-struct loop_slot {
-    struct voice *v;              /* 0 = free */
-    uint32_t asset;
-    int64_t start, len;           /* loop region in the file; len = the next (or last) jump */
-    uint32_t passes;              /* jumps done on this clip: the crossfade starts with the first */
-    uint32_t xf0;                 /* where the last jump landed, samples after start: the crossfade starts there */
-    int64_t cend;                 /* clip end in the file */
-    int64_t lenq, acc;            /* loop length and jump accumulator, 48.16 fixed point */
-};
-struct loop_state {
-    uint32_t magic;
-    uint32_t mask;                /* bit n: track (player queue id) n loops */
-    uint32_t wraps;               /* jumps done, for tests */
-    uint32_t bars;                /* loop length in bars when a track has none, 0 = whole clip (tests) */
-    struct loop_slot slot[SLOTS];
-    uint8_t owner[LOOP_SLOTS];    /* track + 1 holding each loop slot, 0 = free */
-    uint8_t chbars[TRACKS];       /* BARS per track, 0 = not received */
-    uint16_t want;                /* bit n: track n has LOOP on (with or without a slot) */
-    int16_t chfilter[TRACKS];     /* FILTER per track */
-    uint8_t chfade[TRACKS];       /* FADE per track, bars */
-    struct track_fx {
-        float ic[4];              /* SVF state: L ic1 ic2, R ic1 ic2 */
-        float gain;               /* gain at the end of the last block */
-        float g0, k0;             /* filter coefficients of the last block (g = tan(pi fc / fs), k = 1/Q) */
-        int32_t mode0;            /* filter mode of the last block: 0 off, 1 low-pass, 2 high-pass */
-        int32_t fade_left, fade_total;   /* samples; fade_total 0 = not fading */
-        uint8_t fading;           /* LOOP went off with FADE > 0: the loop keeps its slot until the fade ends */
-        uint8_t seen;             /* a looping voice of this track rendered since the last loop_process */
-        uint8_t auto_wait;        /* a moved clip has no voice yet: plan it again each block */
-        uint8_t _p;
-        uint32_t auto_asset;      /* the clip autostart last moved (not again), 0xFFFFFFFF = none */
-        uint32_t pend_asset;      /* a moved clip whose voice is still to come: its loop region below */
-        int32_t pend_start;       /* file position of the loop start, samples */
-        int64_t pend_lenq;        /* loop length, 48.16 */
-    } fx[TRACKS];
-    /* the block being rendered (set by loop_voice around the stock voice call, read by loop_read) */
-    int32_t cur_track;            /* -1 = none */
-    uint32_t cur_asset;
-    float cur_g0, cur_g1;         /* gain ramp across the block */
-    float cur_fg, cur_fk;         /* filter coefficients for the block */
-    int32_t cur_mode;
-    uint32_t autostarts;          /* for tests */
-};
-#include <stddef.h>
-_Static_assert(sizeof(struct loop_slot) == 56 && offsetof(struct loop_state, slot) == 16, "state layout (tests, sim)");
-_Static_assert(offsetof(struct loop_state, owner) == 0x710 && offsetof(struct loop_state, chbars) == 0x712 &&
-               offsetof(struct loop_state, want) == 0x71e, "state layout (tests, sim)");
-#define LS ((volatile struct loop_state *)0x3800F000u)
-#define LS_MAGIC 0x374f4f4cu      /* "LOO7": layout version; any other value (old layout, power-up) re-initialises */
-#define P_QUEUE 0x18              /* the player node's queue id = its channel */
-#define T_BPM 0x18                /* transport: float tempo */
-#define T_POS 0x30                /* transport: int64 position, ticks */
-#define BAR_TICKS 3840            /* 4/4 at 960 PPQ */
-#define MAX_BARS 16
-
-static struct loop_state *state(void)
+static struct loop_shared *state(void)
 {
-    struct loop_state *s = (struct loop_state *)LS;
-    if (s->magic != LS_MAGIC) {
-        for (unsigned i = 0; i < SLOTS; i++)
-            s->slot[i].v = 0;
-        s->mask = 0;
-        s->wraps = 0;
-        s->bars = 0;
-        for (unsigned i = 0; i < LOOP_SLOTS; i++)
-            s->owner[i] = 0;
-        for (unsigned i = 0; i < TRACKS; i++)
-            s->chbars[i] = 0;
-        s->want = 0;
-        for (unsigned i = 0; i < TRACKS; i++) {
+    struct loop_shared *s = (struct loop_shared *)LOOP_SHARED;
+    if (s->magic != LOOP_MAGIC) {
+        for (unsigned i = 0; i < LOOP_TRACKS; i++) {
+            s->cmd[i] = 0;
+            s->chbars[i] = 4;
             s->chfilter[i] = 0;
-            s->chfade[i] = 0;
-            struct track_fx *f = &s->fx[i];
-            f->ic[0] = f->ic[1] = f->ic[2] = f->ic[3] = 0.f;
-            f->gain = 1.f;
-            f->fading = 0;
-            f->fade_total = f->fade_left = 0;
-            f->mode0 = 0;
-            f->auto_asset = 0xffffffffu;
-            f->auto_wait = 0;
-            f->pend_asset = 0xffffffffu;
+            s->chfade[i] = 4;
         }
-        s->cur_track = -1;
-        s->autostarts = 0;
-        s->magic = LS_MAGIC;
+        for (unsigned i = 0; i < LOOP_SLOTS; i++) {
+            struct loop_slot *sl = &s->slot[i];
+            sl->state = LS_IDLE;
+            sl->req = REQ_NONE;
+            sl->gen = 0;
+            sl->reads_failed = 0;
+        }
+        s->blocks = 0;
+        s->magic = LOOP_MAGIC;
     }
     return s;
 }
 
-static struct loop_slot *find(struct loop_state *s, struct voice *v, int make)
-{
-    struct loop_slot *free_ = 0;
-    for (unsigned i = 0; i < SLOTS; i++) {
-        if (s->slot[i].v == v)
-            return &s->slot[i];
-        if (!s->slot[i].v && !free_)
-            free_ = &s->slot[i];
-    }
-    if (make && free_) {
-        free_->v = v;
-        free_->len = 0;
-        free_->passes = 0;
-    }
-    return make ? free_ : 0;
-}
-
-/* Fix the loop region of a voice seen for the first time (or a new clip on it). */
-static void region(struct loop_slot *sl, struct voice *v, uint32_t a3, unsigned bars)
-{
-    sl->asset = v->asset;
-    sl->passes = 0;
-    sl->acc = 0;
-    sl->cend = v->pos + v->left;
-    sl->start = v->pos;                                  /* bars = 0 / fallback: the whole clip */
-    sl->lenq = v->left << 16;
-    if (bars > MAX_BARS)
-        bars = MAX_BARS;
-    uint8_t *t = a3 ? *(uint8_t **)a3 : 0;
-    float bpm = t ? *(float *)(t + T_BPM) : 0.f;
-    if (bars && bpm > 1.f) {
-        /* 32-bit is plenty here (2^31 ticks are > 300 h at 120 BPM, 2^31 samples 12 h) and keeps the conversions on
-         * the FPU (int64 <-> double would need libgcc) */
-        double spt = 48000.0 * 60.0 / (960.0 * bpm);    /* samples per tick */
-        int32_t pos = (int32_t)v->pos, cend = (int32_t)sl->cend;
-        double t0 = (double)(int32_t)*(int64_t *)(t + T_POS) + (double)(int32_t)v->delay / spt;  /* tick of v->pos */
-        int32_t bar = ((int32_t)t0 + BAR_TICKS - 1) / BAR_TICKS * BAR_TICKS;
-        if ((double)bar < t0)
-            bar += BAR_TICKS;
-        int32_t ls = pos + (int32_t)(((double)bar - t0) * spt + 0.5);
-        double barlen = BAR_TICKS * spt;
-        while (bars && (double)ls + bars * barlen + XF > (double)cend)
-            bars--;                                      /* fewer bars if the clip is too short */
-        if (bars) {
-            double q = bars * barlen * 65536.0 + 0.5;    /* < 2^47: split so each part converts in 32 bits */
-            uint32_t hi = (uint32_t)(q / 4294967296.0);
-            uint32_t lo = (uint32_t)(q - (double)hi * 4294967296.0);
-            sl->start = ls;
-            sl->lenq = ((int64_t)hi << 32) | lo;
-        }
-    }
-    sl->len = sl->lenq >> 16;
-}
-
-static int owns(const struct loop_state *s, unsigned track)
-{
-    for (unsigned i = 0; i < LOOP_SLOTS; i++)
-        if (s->owner[i] == track + 1)
-            return 1;
-    return 0;
-}
-
-static int looping(const struct loop_state *s, unsigned track)
-{
-    return track < 32 && ((s->mask >> track & 1) || (track < TRACKS && owns(s, track)));
-}
-
-/* ---- filter and fade ---- */
+/* ---- DSP helpers ---- */
 static float exp2_(float x)                          /* 2^x, |x| < 20, rel. error ~1e-4 */
 {
     int i = (int)(x < 0.f ? x - 1.f : x);
@@ -249,7 +101,18 @@ static float tan_(float x)                           /* 0 <= x < 1.4 */
     return sn / cs;
 }
 
-/* FILTER value (-1000..1000) -> mode and coefficients: low-pass 20 kHz .. 60 Hz, high-pass 20 Hz .. 8 kHz */
+static float qsin(float x)                           /* sin(x pi / 2) on [0, 1], error ~1e-4 */
+{
+    float x2 = x * x;
+    return x * (1.5707963f - x2 * (0.6459640f - x2 * 0.0796926f));
+}
+
+static float qcos(float x)
+{
+    return qsin(1.f - x);
+}
+
+/* FILTER value (-1000..1000) -> mode and coefficients: low-pass 20 kHz .. 60 Hz, high-pass 20 Hz .. 8 kHz (TPT SVF) */
 static int filter_coef(float v, float *g, float *k)
 {
     float fc;
@@ -264,391 +127,359 @@ static int filter_coef(float v, float *g, float *k)
         return 0;
     float x = 3.14159265f * fc / 48000.f;
     *g = tan_(x > 1.35f ? 1.35f : x);
-    *k = 1.25f;                                                    /* Q 0.8: a touch of resonance */
+    *k = 1.25f;                                                    /* Q 0.8 */
     return mode;
 }
 
-static float qcos(float x);                          /* cos(x pi / 2) on [0, 1] (below) */
-
-/* Gain and filter for this block of `track`'s loop (called by loop_voice before the stock voice renders it). */
-static void fx_block(struct loop_state *s, unsigned track, unsigned n, uint32_t a3)
+static void svf(float *x, float *ic, int n, int mode, float g, float k)
 {
-    struct track_fx *f = &s->fx[track];
-    float filt = (float)s->chfilter[track], gain = 1.f;
-    if (f->fading) {
-        if (!f->fade_total) {                            /* the fade starts: its length at the current tempo */
-            uint8_t *t = a3 ? *(uint8_t **)a3 : 0;
-            float bpm = t ? *(float *)(t + 0x18) : 120.f;
-            if (bpm < 1.f)
-                bpm = 120.f;
-            f->fade_total = (int32_t)((float)s->chfade[track] * 4.f * 60.f * 48000.f / bpm);
-            f->fade_left = f->fade_total;
-        }
-        f->fade_left -= (int32_t)n;
-        float u = f->fade_left <= 0 ? 1.f : 1.f - (float)f->fade_left / (float)f->fade_total;
-        gain = qcos(u);
-        filt += (-1000.f - filt) * u;                    /* the filter closes towards low-pass 60 Hz */
+    float a1 = 1.f / (1.f + g * (g + k)), a2 = g * a1, a3 = g * a2;
+    float i1 = ic[0], i2 = ic[1];
+    for (int j = 0; j < n; j++) {
+        float v3 = x[j] - i2, v1 = a1 * i1 + a2 * v3, v2 = i2 + a2 * i1 + a3 * v3;
+        i1 = 2.f * v1 - i1;
+        i2 = 2.f * v2 - i2;
+        x[j] = mode == 1 ? v2 : x[j] - k * v1 - v2;
     }
-    s->cur_track = (int32_t)track;
-    s->cur_g0 = f->gain;
-    s->cur_g1 = gain;
-    f->gain = gain;
-    s->cur_mode = filter_coef(filt, &s->cur_fg, &s->cur_fk);
-    if (s->cur_mode != f->mode0) {                       /* mode change: start the filter from rest */
-        f->ic[0] = f->ic[1] = f->ic[2] = f->ic[3] = 0.f;
-        f->mode0 = s->cur_mode;
-    }
+    ic[0] = i1;
+    ic[1] = i2;
 }
 
-/* apply gain ramp and filter to the block the voice just read (one channel) */
-static void fx_apply(struct loop_state *s, float *x, float *ic, int n)
+/* samples of `bars` bars at `bpm`, as 48.16 (no 64-bit division / conversion helpers in the cave) */
+static uint64_t bars_q(unsigned bars, float bpm)
 {
-    float g0 = s->cur_g0, dg = (s->cur_g1 - s->cur_g0) / (float)n;
-    if (s->cur_mode) {
-        float g = s->cur_fg, k = s->cur_fk;
-        float a1 = 1.f / (1.f + g * (g + k)), a2 = g * a1, a3 = g * a2;
-        float i1 = ic[0], i2 = ic[1];
-        for (int j = 0; j < n; j++) {
-            float v3 = x[j] - i2, v1 = a1 * i1 + a2 * v3, v2 = i2 + a2 * i1 + a3 * v3;
-            i1 = 2.f * v1 - i1;
-            i2 = 2.f * v2 - i2;
-            x[j] = s->cur_mode == 1 ? v2 : x[j] - k * v1 - v2;
-        }
-        ic[0] = i1;
-        ic[1] = i2;
-    }
-    if (g0 != 1.f || dg != 0.f)
-        for (int j = 0; j < n; j++)
-            x[j] *= g0 + dg * (float)(j + 1);
-}
-
-static void set_loop(struct loop_state *s, unsigned track, int on);
-static void release(struct loop_state *s, unsigned track);
-
-/* ---- a freshly recorded clip loops at once ----
- * The track player (the channel's first node, vtable 0x0806BFDC, process 0x08057B70) keeps its clips at +0x98 (0x28
- * bytes each: +0x08 asset, +0x10 int64 start, +0x18 int64 end, +0x20 int64 offset into the file, all in ticks;
- * count +0x598) and two voices at +0x20 / +0x58. It starts a clip's voice when the transport reaches the clip, so a
- * clip that was just recorded (the transport is past its end when it appears) would not play until the transport
- * comes back. autostart moves the clip entry instead: it now starts a 16th from now, at the loop's phase of that
- * moment (offset = loop start + ((start - loop start) mod loop length)), and lets the stock plan it from the transport
- * (0x08057900(player, -, ctx), what the player does at PLAY on message 0x57; after that it plans only while a voice
- * plays, so a clip arriving on a silent track would wait for the next PLAY). The stock start (0x0805779C) needs the
- * file's length from the stream cache (vtable +0x14); right after a take the M4 streamer registers the file again and
- * the length is unknown (-1) for a moment, so the planning is repeated each block until a voice runs (auto_wait).
- * The loop region is handed to loop_voice through the track's pend_* fields. Taken: the clip of this track that ended
- * at most eight bars ago, once per clip. */
-struct clip { uint32_t _0, _4, asset, _c; int64_t start, end, offset; };
-#define PL_CLIPS 0x98
-#define PL_COUNT 0x598
-#define PL_VOICE_A 0x20
-#define PL_VOICE_B 0x58
-#define PL_INDEX 0x5a0
-#define fw_plan ((void (*)(void *, uint32_t, uint32_t))FN(0x08057900))
-#define AUTO_WAIT_BLOCKS 200      /* ~133 ms of retries */
-#define LEAD_TICKS 240            /* a moved clip starts this far ahead (a 16th) */
-
-static void autostart(struct loop_state *s, uint8_t *player, void *bus, uint32_t a3, unsigned track)
-{
-    (void)bus;
-    struct voice *va = (struct voice *)(player + PL_VOICE_A), *vb = (struct voice *)(player + PL_VOICE_B);
-    uint8_t *t = a3 ? *(uint8_t **)a3 : 0;
-    struct track_fx *f = &s->fx[track];
-    if (va->active || vb->active || !t) {
-        f->auto_wait = 0;
-        return;
-    }
-    if (f->auto_wait) {
-        f->auto_wait--;
-        fw_plan(player, 0, a3);
-        return;
-    }
-    float bpm = *(float *)(t + T_BPM);
-    unsigned bars = s->chbars[track] ? s->chbars[track] : s->bars;
-    int32_t count = *(int32_t *)(player + PL_COUNT);
-    if (bpm < 1.f || !bars || count <= 0 || count > 256)
-        return;
-    if (bars > MAX_BARS)
-        bars = MAX_BARS;
-    int32_t now = (int32_t)*(int64_t *)(t + T_POS);
-    struct clip *c = 0;
-    int32_t ci = 0;
-    for (int32_t i = 0; i < count; i++) {
-        struct clip *k = (struct clip *)(player + PL_CLIPS) + i;
-        int32_t end = (int32_t)k->end;
-        if (end <= now && now - end < 8 * BAR_TICKS && k->asset != f->auto_asset && (!c || end > (int32_t)c->end)) {
-            c = k;
-            ci = i;
-        }
-    }
-    if (!c)
-        return;
-    f->auto_asset = c->asset;                            /* once per clip */
-    int32_t cs = (int32_t)c->start, ce = (int32_t)c->end;
-    int32_t ls = (cs + BAR_TICKS - 1) / BAR_TICKS * BAR_TICKS;    /* the loop starts on the first bar line */
-    while (bars && ls + (int32_t)bars * BAR_TICKS + 16 > ce)
-        bars--;                                          /* (16 ticks: room for the crossfade at 120 BPM and up) */
-    if (!bars || now < ls)
-        return;
-    /* move the clip so that it starts a 16th from now, at the loop's phase of that moment: the player starts it like
-     * any coming clip (the stock start needs the file's length, which the stock streaming learns for coming clips) */
-    int32_t lt = (int32_t)bars * BAR_TICKS, st = now + LEAD_TICKS, phase = (st - ls) % lt;
-    c->start = st;
-    c->offset = c->offset + (ls - cs) + phase;
-    c->end = st + (ce - ls - phase);
-    *(int32_t *)(player + PL_INDEX) = ci;
-    double spt = 48000.0 * 60.0 / (960.0 * bpm);
-    f->pend_asset = c->asset;
-    f->pend_start = (int32_t)((double)(int32_t)(c->offset - phase) * spt + 0.5);
-    double q = (double)lt * spt * 65536.0 + 0.5;
+    double q = (double)bars * 4.0 * 60.0 * 48000.0 / (double)bpm * 65536.0 + 0.5;
     uint32_t hi = (uint32_t)(q / 4294967296.0);
     uint32_t lo = (uint32_t)(q - (double)hi * 4294967296.0);
-    f->pend_lenq = ((int64_t)hi << 32) | lo;
-    s->autostarts++;
-    f->auto_wait = AUTO_WAIT_BLOCKS;
-    fw_plan(player, 0, a3);
+    return ((uint64_t)hi << 32) | lo;
 }
 
-void loop_voice(void *player, void *voice, void *bus, uint32_t a3)
+static int bar_index(const uint8_t *t)
 {
-    struct loop_state *s = state();
-    struct voice *v = voice;
-    unsigned track = *(uint32_t *)((uint8_t *)player + P_QUEUE);
+    int64_t ticks = *(const int64_t *)(t + T_POS);
+    return (int)((int32_t)ticks / BAR_TICKS);
+}
 
-    s->cur_track = -1;                                   /* set again by fx_block for a looping block */
-    if (!v->active || v->ending || !looping(s, track)) {
-        struct loop_slot *sl = find(s, v, 0);
-        if (sl) {
-            sl->v = 0;                                   /* voice ended or LOOP off: forget it */
-            if (v->active && !v->ending && sl->passes) {
-                /* LOOP switched off while looping: end the clip at this block (the stock fade and next clip follow),
-                 * instead of playing on past the loop into the rest of the recording */
-                int64_t n = fw_frames(bus);
-                if (v->left > n)
-                    v->left = n;
-            }
+/* ---- slots ---- */
+static int slot_of(const struct loop_shared *s, unsigned track)
+{
+    for (int i = 0; i < LOOP_SLOTS; i++)
+        if (s->slot[i].state != LS_IDLE && s->slot[i].track == track && s->slot[i].state != LS_FADE)
+            return i;
+    return -1;
+}
+
+static void start_fade(struct loop_shared *s, struct loop_slot *sl, const uint8_t *t)
+{
+    float bpm = t ? *(const float *)(t + T_BPM) : 120.f;
+    if (bpm < 1.f)
+        bpm = 120.f;
+    unsigned bars = s->chfade[sl->track];
+    sl->fade_total = bars ? (int32_t)((float)bars * 4.f * 60.f * 48000.f / bpm) : XF;
+    sl->fade_left = sl->fade_total;
+    sl->state = LS_FADE;
+}
+
+/* the LOOP key of `track`: arm a free slot, or stop the track's loop */
+static void key(struct loop_shared *s, unsigned track, const uint8_t *t)
+{
+    int i = slot_of(s, track);
+    if (i >= 0) {
+        struct loop_slot *sl = &s->slot[i];
+        if (sl->state == LS_PLAY)
+            start_fade(s, sl, t);
+        else {
+            if (sl->state != LS_CLOSING)
+                sl->req = REQ_CANCEL;       /* armed / recording: the M4 closes the file */
+            sl->state = LS_IDLE;
         }
-        fw_voice(player, voice, bus, a3);
         return;
     }
-    struct loop_slot *sl = find(s, v, 1);
-    if (!sl) {                                           /* table full: stock behaviour */
-        fw_voice(player, voice, bus, a3);
-        return;
+    for (i = 0; i < LOOP_SLOTS; i++)
+        if (s->slot[i].state == LS_IDLE)
+            break;
+    if (i == LOOP_SLOTS)
+        return;                             /* both slots busy */
+    struct loop_slot *sl = &s->slot[i];
+    sl->track = (uint8_t)track;
+    sl->gen ^= 1;
+    sl->asset = (uint16_t)(LOOP_ASSET0 + 2 * i + sl->gen);
+    sl->bars = s->chbars[track];
+    sl->written = 0;
+    sl->clock = 0;
+    sl->armed_bar = t ? bar_index(t) : 0;
+    sl->gain = 1.f;
+    sl->ic[0] = sl->ic[1] = sl->ic[2] = sl->ic[3] = 0.f;
+    sl->mode0 = 0;
+    sl->xf_left = 0;
+    sl->req = REQ_OPEN_W;
+    sl->state = LS_ARMED;
+}
+
+/* Reading the loop file from the cache ourselves. The stock read (0x0805B350) finds a block through the file's
+ * block table (pointer at cache + 0x352C + 4 * file slot, u16 entries indexed by b + 0x400 for b < 32, else b & 0x3FF)
+ * or a short list per file, and copies without checking the block's data pointer. Descriptors (fields as the stock
+ * code addresses them, at cache + 24 * e + offset): +4 float data, +8 block, +0x10 samples in it, +0x14 asset,
+ * +0x16 the right channel's descriptor, +0x18 in use, +0x19 being loaded. Here a block counts only with data, not
+ * being loaded, holding the samples asked for; anything else is requested (0x0805B210, asks the M4 for 4 blocks
+ * from b) and read as silence, so a block that is not there yet can never fault. The copy is ours. */
+struct cdesc { uint32_t _0; float *data; uint32_t block, lru, count; uint16_t asset, pair; uint8_t state, loading; };
+#define CDESC(e) ((volatile struct cdesc *)((uint8_t *)CACHE + 24 * (e)))
+#define NO_DATA ((float *)0xffffffffu)
+
+/* the descriptor of block b of the asset with at least `need` samples, or -1 (then requested when stale / missing) */
+static int find(uint32_t asset, uint32_t b, uint32_t need)
+{
+    uint16_t f = CACHE_MAP(asset);
+    if (f == 0xffff)
+        return -1;
+    volatile uint16_t *tbl = *(volatile uint16_t *const *)((uint8_t *)CACHE + 0x352c + 4 * f);
+    uint32_t i = b < 32 ? b + 0x400 : (b & 0x3ff);
+    uint16_t e = tbl[i];
+    if (e < 288 && CDESC(e)->asset == asset && CDESC(e)->block == b) {
+        volatile struct cdesc *d = CDESC(e);
+        if (d->loading)
+            return -1;                  /* on its way */
+        if (d->data != NO_DATA && d->count >= need)
+            return e;
+
     }
-    if (sl->len <= 0 || sl->asset != v->asset || v->pos + v->left != sl->cend) {
-        struct track_fx *pf = track < TRACKS ? &s->fx[track] : 0;
-        if (pf && pf->pend_asset == v->asset) {          /* a clip autostart moved: its region is known */
-            pf->pend_asset = 0xffffffffu;
-            sl->asset = v->asset;
-            sl->passes = 0;
-            sl->acc = 0;
-            sl->xf0 = 0;
-            sl->cend = v->pos + v->left;
-            sl->start = pf->pend_start;
-            sl->lenq = pf->pend_lenq;
-            sl->len = sl->lenq >> 16;
-        } else
-            region(sl, v, a3, track < TRACKS && s->chbars[track] ? s->chbars[track] : s->bars);   /* new clip */
+    fw_creq(CACHE, asset, b);
+    return -1;
+}
+
+/* read k samples of the asset at p into l / r; 0 (silence) when a block is not there */
+static int cread(uint32_t asset, uint32_t p, float *l, float *r, int k)
+{
+    while (k > 0) {
+        uint32_t b = p / BLOCK, off = p - b * BLOCK, m = BLOCK - off < (uint32_t)k ? BLOCK - off : (uint32_t)k;
+        int e = find(asset, b, off + m);
+        if (e < 0)
+            return 0;
+        const float *dl = CDESC(e)->data, *dr = dl;
+        uint16_t pr = CDESC(e)->pair;
+        if (pr < 288 && CDESC(pr)->data != NO_DATA && CDESC(pr)->count >= off + m)
+            dr = CDESC(pr)->data;
+        for (uint32_t j = 0; j < m; j++) {
+            l[j] = dl[off + j];
+            r[j] = dr[off + j];
+        }
+        p += m;
+        l += m;
+        r += m;
+        k -= (int)m;
     }
-    int64_t n = fw_frames(bus);
-    if (track < TRACKS && s->fx[track].fading && s->fx[track].fade_total && s->fx[track].fade_left <= 0) {
-        /* the fade is over: give the slot back and end the clip at this block (silent by now) */
-        s->fx[track].fading = 0;
-        s->fx[track].fade_total = 0;
-        s->fx[track].gain = 1.f;
-        release(s, track);
-        sl->v = 0;
-        if (v->left > n)
-            v->left = n;
-        fw_voice(player, voice, bus, a3);
-        return;
-    }
-    int wrap = sl->len > n && v->pos + n >= sl->start + sl->len;
-    if (wrap)
-        v->left += sl->len;                              /* keep the stock code from ending the clip */
-    if (track < TRACKS) {
-        fx_block(s, track, (unsigned)n, a3);
-        s->cur_asset = v->asset;
-        s->fx[track].seen = 1;
-    }
-    fw_voice(player, voice, bus, a3);
-    if (wrap && v->active) {
-        v->pos -= sl->len;                               /* left (+len before the block) = clip end - pos again */
-        sl->xf0 = (uint32_t)(v->pos - sl->start);
-        sl->passes++;
-        s->wraps++;
-        /* next jump: whole samples from the accumulator, the fractions carried over */
-        sl->acc += sl->lenq - ((int64_t)sl->len << 16);
-        sl->len = (sl->lenq + sl->acc) >> 16;
+    return 1;
+}
+
+/* read k samples of the loop at whole-sample position p (silence where a block is not there) */
+static void get(struct loop_slot *sl, int64_t p, float *l, float *r, int k)
+{
+    if (!cread(sl->asset, (uint32_t)(p + sl->start), l, r, k)) {
+        for (int j = 0; j < k; j++)
+            l[j] = r[j] = 0.f;
+        sl->reads_failed++;
     }
 }
 
-/* LOOP on/off for a track. With FADE > 0, LOOP off keeps the slot while the loop fades out (loop_voice gives it back
- * at the end); LOOP on again during the fade cancels it. Slots go in switch-on order; a track that switched on while both were taken gets the next
- * slot that frees up (lowest track number first), as its LOOP stays on and is not sent again. */
-static void set_loop(struct loop_state *s, unsigned track, int on)
+/* ask for block b ahead of reading it (find requests it unless it is loaded) */
+static void prefetch(struct loop_slot *sl, uint32_t b)
 {
-    struct track_fx *f = &s->fx[track];
-    if (on) {
-        s->want |= (uint16_t)(1u << track);
-        f->fading = 0;
-        f->fade_total = 0;
-    } else {
-        s->want &= (uint16_t)~(1u << track);
-        if (owns(s, track) && s->chfade[track] && !f->fading) {
-            f->fading = 1;                               /* fade out first (loop_voice), keep the slot meanwhile */
-            f->fade_total = 0;
+    find(sl->asset, b, 1);
+}
+
+/* the next n samples of the loop, crossfaded at the wrap: after a jump back by `jump` samples, the first XF samples
+ * mix the head x(p) fading in with the continuation x(p + jump) fading out (equal power; the file holds XF samples
+ * past the loop end) */
+static void __attribute__((noinline)) render(struct loop_slot *sl, float *l, float *r, int n)
+{
+    float *tl = WORK->tl, *tr = WORK->tr;
+    int j = 0;
+    /* keep the next block and, in the last quarter of a pass, the loop start in the cache */
+    uint32_t st = (uint32_t)sl->start, p0 = st + (uint32_t)(sl->posq >> 16), len = (uint32_t)(sl->lenq >> 16);
+    uint32_t last = ((uint32_t)sl->target - 1) / BLOCK;
+    if (p0 / BLOCK + 1 <= last)
+        prefetch(sl, p0 / BLOCK + 1);
+    if (p0 - st > len - len / 4) {
+        prefetch(sl, st / BLOCK);
+        if (st / BLOCK + 1 <= last)
+            prefetch(sl, st / BLOCK + 1);
+    }
+    while (j < n) {
+        int64_t p = (int64_t)(sl->posq >> 16);
+        uint64_t to_end = sl->lenq - sl->posq;
+        int64_t w = (int64_t)((to_end + 0xffff) >> 16);
+        int k = n - j < w ? n - j : (int)w;
+        if (k < 1)
+            k = 1;
+        get(sl, p, l + j, r + j, k);
+        if (sl->xf_left > 0) {
+            int m = k < sl->xf_left ? k : sl->xf_left, done = XF - sl->xf_left;
+            get(sl, p + sl->jump, tl, tr, m);
+            for (int i = 0; i < m; i++) {
+                float g = ((float)(done + i) + 0.5f) * (1.f / XF), a = qsin(g), b = qsin(1.f - g);
+                l[j + i] = l[j + i] * a + tl[i] * b;
+                r[j + i] = r[j + i] * a + tr[i] * b;
+            }
+            sl->xf_left -= m;
+        }
+        sl->posq += (uint64_t)k << 16;
+        j += k;
+        if (sl->posq >= sl->lenq) {
+            int64_t before = (int64_t)(sl->posq >> 16);
+            sl->posq -= sl->lenq;
+            sl->jump = (int32_t)(before - (int64_t)(sl->posq >> 16));
+            sl->xf_left = XF;
+        }
+    }
+}
+
+/* filter and gain ramp of a playing / fading slot for this block */
+static void fx(struct loop_shared *s, struct loop_slot *sl, float *l, float *r, int n)
+{
+    float filt = (float)s->chfilter[sl->track], gain = 1.f;
+    if (sl->state == LS_FADE) {
+        sl->fade_left -= n;
+        float u = sl->fade_left <= 0 ? 1.f : 1.f - (float)sl->fade_left / (float)sl->fade_total;
+        gain = qcos(u);
+        if (sl->fade_total > XF)
+            filt += (-1000.f - filt) * u;    /* the filter closes towards low-pass 60 Hz */
+    }
+    float g, k;
+    int mode = filter_coef(filt, &g, &k);
+    if (mode != sl->mode0) {
+        sl->ic[0] = sl->ic[1] = sl->ic[2] = sl->ic[3] = 0.f;
+        sl->mode0 = mode;
+    }
+    if (mode) {
+        svf(l, sl->ic, n, mode, g, k);
+        svf(r, sl->ic + 2, n, mode, g, k);
+    }
+    float g0 = sl->gain, dg = (gain - g0) / (float)n;
+    for (int j = 0; j < n; j++) {
+        float gj = g0 + dg * (float)(j + 1);
+        l[j] *= gj;
+        r[j] *= gj;
+    }
+    sl->gain = gain;
+    if (sl->state == LS_FADE && sl->fade_left <= 0)
+        sl->state = LS_IDLE;
+}
+
+static void run_slot(struct loop_slot *sl, const uint8_t *t, float *l, float *r, int n)
+{
+    switch (sl->state) {
+    case LS_ARMED: {
+        if (!t)
+            return;
+        int bar = bar_index(t);
+        if (bar == sl->armed_bar)
+            return;
+        sl->armed_bar = bar;
+        if (sl->req != REQ_NONE || CACHE_MAP(sl->asset) == 0xffff)
+            return;                          /* file not open yet: the next bar line */
+        float bpm = *(const float *)(t + T_BPM);
+        unsigned bars = sl->bars < 1 ? 1 : sl->bars > MAX_BARS ? MAX_BARS : sl->bars;
+        sl->lenq = bars_q(bars, bpm < 1.f ? 120.f : bpm);
+        sl->start = 0;
+        sl->target = (int32_t)(sl->lenq >> 16) + XF + 64;
+        sl->clock = 0;
+        sl->state = LS_REC;
+    }
+        /* this block is the first one recorded */
+        /* fall through */
+    case LS_REC:
+        fw_cwrite(CACHE, sl->asset, l, r, n);
+        sl->written += n;
+        sl->clock += (uint32_t)n;
+        if (sl->written >= sl->target) {
+            sl->req = REQ_CLOSE;
+            sl->state = LS_CLOSING;
+        }
+        return;
+    case LS_CLOSING: {
+        int64_t flen = -1;
+        if (sl->req == REQ_NONE)
+            fw_clen(&flen, CACHE, sl->asset);
+        if (sl->req != REQ_NONE || flen < (int64_t)sl->target) {
+            sl->clock += (uint32_t)n;
             return;
         }
+        /* the loop joins at the phase the transport has reached since the recording started (this block starts
+         * `clock` samples after the loop start), once the block there is loaded (asked for meanwhile) */
+        uint64_t q = (uint64_t)sl->clock << 16;
+        while (q >= sl->lenq)
+            q -= sl->lenq;
+        uint32_t p = (uint32_t)sl->start + (uint32_t)(q >> 16);
+        uint32_t need = p % BLOCK + (uint32_t)n;
+        if (find(sl->asset, p / BLOCK, need < BLOCK ? need : BLOCK) < 0) {
+            sl->clock += (uint32_t)n;
+            return;
+        }
+        sl->posq = q;
+        sl->xf_left = 0;
+        sl->gain = 0.f;                      /* ramp in over the first block */
+        sl->state = LS_PLAY;
+        return;
     }
-    for (unsigned i = 0; i < LOOP_SLOTS; i++)
-        if (s->owner[i] && !(s->want >> (s->owner[i] - 1) & 1) && !s->fx[s->owner[i] - 1].fading)
-            s->owner[i] = 0;
-    if (on && !owns(s, track))
-        for (unsigned i = 0; i < LOOP_SLOTS; i++)
-            if (!s->owner[i]) {
-                s->owner[i] = (uint8_t)(track + 1);
-                return;
-            }
-    for (unsigned i = 0; i < LOOP_SLOTS; i++)         /* fill freed slots from the waiting tracks */
-        for (unsigned t = 0; !s->owner[i] && t < TRACKS; t++)
-            if ((s->want >> t & 1) && !owns(s, t))
-                s->owner[i] = (uint8_t)(t + 1);
-}
-
-/* give a track's slot back (end of its fade) and hand free slots to waiting tracks */
-static void release(struct loop_state *s, unsigned track)
-{
-    for (unsigned i = 0; i < LOOP_SLOTS; i++)
-        if (s->owner[i] == track + 1)
-            s->owner[i] = 0;
-    for (unsigned i = 0; i < LOOP_SLOTS; i++)
-        for (unsigned t = 0; !s->owner[i] && t < TRACKS; t++)
-            if ((s->want >> t & 1) && !owns(s, t))
-                s->owner[i] = (uint8_t)(t + 1);
-}
-
-/* the track player's process (vtable 0x0806BFDC slot 3, 0x08057B70(player, ctx)): with no voice playing it does not
- * render voices, so autostart runs here, every block; ctx is what the voices get as a3 (its first word -> transport) */
-#define fw_player_proc ((process_fn)FN(0x08057b70))
-int loop_player(void *obj, void *ctx)
-{
-    struct loop_state *s = state();
-    unsigned track = *(uint32_t *)((uint8_t *)obj + P_QUEUE);
-    if (track < TRACKS && looping(s, track) && !s->fx[track].fading)
-        autostart(s, obj, 0, (uint32_t)ctx, track);
-    return fw_player_proc(obj, ctx);
+    default:
+        return;
+    }
 }
 
 int loop_process(void *obj, void *ctx)
 {
-    struct loop_state *s = state();
+    struct loop_shared *s = state();
     unsigned track = *(uint32_t *)((uint8_t *)obj + P_QUEUE);
-    if (track < TRACKS) {
-        /* a fade with nothing playing (transport stopped, no clip) would never end: free the slot at once */
-        if (s->fx[track].fading && !s->fx[track].seen) {
-            s->fx[track].fading = 0;
-            s->fx[track].fade_total = 0;
-            s->fx[track].gain = 1.f;
-            release(s, track);
-        }
-        s->fx[track].seen = 0;
-        void *q = fw_queue(ctx, track);
-        struct fw_ev ev;
-        for (unsigned i = 0; fw_next_ev(q, i, &ev); i++) {
-            if (ev.type != 0x39 || ev.dest != track)
-                continue;
-            if (ev.id == P_LOOP)
-                set_loop(s, track, ev.value != 0);
-            else if (ev.id == P_BARS)
-                s->chbars[track] = (uint8_t)(ev.value < 1 ? 1 : ev.value > MAX_BARS ? MAX_BARS : ev.value);
-            else if (ev.id == P_FILTER)
-                s->chfilter[track] = (int16_t)(ev.value < -1000 ? -1000 : ev.value > 1000 ? 1000 : ev.value);
-            else if (ev.id == P_FADE)
-                s->chfade[track] = (uint8_t)(ev.value < 0 ? 0 : ev.value > MAX_BARS ? MAX_BARS : ev.value);
-        }
-    }
-    return fw_player(obj, ctx);
-}
-
-/* sin(x pi / 2) on [0, 1], error ~1e-4 */
-static float qsin(float x)
-{
-    float x2 = x * x;
-    return x * (1.5707963f - x2 * (0.6459640f - x2 * 0.0796926f));
-}
-
-static struct loop_slot *slot_of(struct loop_state *s, uint32_t asset)
-{
-    for (unsigned i = 0; i < SLOTS; i++)
-        if (s->slot[i].v && s->slot[i].asset == asset)
-            return &s->slot[i];
-    return 0;
-}
-
-static float qcos(float x)
-{
-    return qsin(1.f - x);
-}
-
-static int loop_read_(void *cache, void *fn, int64_t pos, uint32_t asset, float *l, float *r, int n);
-
-int loop_read(void *cache, void *fn, int64_t pos, uint32_t asset, float *l, float *r, int n)
-{
-    int ok = loop_read_(cache, fn, pos, asset, l, r, n);
-    struct loop_state *s = state();
-    if (ok && n > 0 && s->cur_track >= 0 && s->cur_track < TRACKS && s->cur_asset == asset) {
-        struct track_fx *f = &s->fx[s->cur_track];
-        if (l)
-            fx_apply(s, l, f->ic, n);
-        if (r)
-            fx_apply(s, r, f->ic + 2, n);
-    }
-    return ok;
-}
-
-static int loop_read_(void *cache, void *fn, int64_t pos, uint32_t asset, float *l, float *r, int n)
-{
-    int ok = fw_read(cache, fn, pos, asset, l, r, n);
-    if (n <= 0 || n > MAXN)
-        return ok;
-    struct loop_state *s = state();
-    struct loop_slot *sl = slot_of(s, asset);
-    if (!sl)
-        return ok;
-    int64_t end = sl->start + sl->len;
-    if (!ok) {
-        /* the last block of a pass reaches past the end of the file: the stock read fails for all of it and the
-         * voice would play silence; read the part up to the loop end, silence after it */
-        if (!(pos < end && pos + n > end) || !fw_read(cache, fn, pos, asset, l, r, (int)(end - pos)))
-            return ok;
-        for (int i = (int)(end - pos); i < n; i++) {
-            if (l)
-                l[i] = 0.f;
-            if (r)
-                r[i] = 0.f;
-        }
-        ok = 1;
-    }
-    if (!sl->passes)
-        return ok;
-    int64_t off = pos - sl->start - sl->xf0;            /* samples since the jump landed */
-    if (off >= XF || off + n <= 0)
-        return ok;
-    float tl[MAXN], tr[MAXN];
-    if (!fw_read(cache, fn, pos + sl->len, asset, l ? tl : 0, r ? tr : 0, n))
-        for (int i = 0; i < n; i++)
-            tl[i] = tr[i] = 0.f;                         /* past the end of the file: fade in from silence */
-    for (int i = 0; i < n; i++) {
-        int64_t k = off + i;
-        if (k < 0 || k >= XF)
+    if (track >= LOOP_TRACKS || !ctx)
+        return fw_stock_proc(obj, ctx);
+    const uint8_t *t = *(const uint8_t **)ctx;
+    if (track == 0)
+        s->blocks++;
+    void *q = fw_queue(ctx, track);
+    struct fw_ev ev;
+    for (unsigned i = 0; fw_next_ev(q, i, &ev); i++) {
+        if (ev.type != 0x39 || ev.dest != track)
             continue;
-        float g = ((float)k + 0.5f) * (1.f / XF), a = qsin(g), b = qsin(1.f - g);
-        if (l)
-            l[i] = l[i] * a + tl[i] * b;
-        if (r)
-            r[i] = r[i] * a + tr[i] * b;
+        if (ev.id == P_BARS)
+            s->chbars[track] = (uint8_t)(ev.value < 1 ? 1 : ev.value > MAX_BARS ? MAX_BARS : ev.value);
+        else if (ev.id == P_FILTER)
+            s->chfilter[track] = (int16_t)(ev.value < -1000 ? -1000 : ev.value > 1000 ? 1000 : ev.value);
+        else if (ev.id == P_FADE)
+            s->chfade[track] = (uint8_t)(ev.value < 0 ? 0 : ev.value > MAX_BARS ? MAX_BARS : ev.value);
     }
-    return ok;
+    if (s->cmd[track]) {
+        s->cmd[track] = 0;
+        key(s, track, t);
+    }
+    int busy = 0;
+    for (int i = 0; i < LOOP_SLOTS; i++)
+        if (s->slot[i].state != LS_IDLE && s->slot[i].track == track)
+            busy = 1;
+    if (busy) {
+        void *bus = fw_bus(ctx, *(uint16_t *)((uint8_t *)obj + P_PORT));
+        int n = (int)fw_frames(bus);
+        float *l = 0, *r = 0;
+        fw_stereo(bus, &l, &r);
+        if (l && r && n > 0 && n <= MAXN) {
+            for (int i = 0; i < LOOP_SLOTS; i++) {      /* record first: the bus without this track's loops */
+                struct loop_slot *sl = &s->slot[i];
+                if (sl->track == track && sl->state >= LS_ARMED && sl->state <= LS_CLOSING)
+                    run_slot(sl, t, l, r, n);
+            }
+            for (int i = 0; i < LOOP_SLOTS; i++) {
+                struct loop_slot *sl = &s->slot[i];
+                if (sl->track != track || (sl->state != LS_PLAY && sl->state != LS_FADE))
+                    continue;
+                float *ll = WORK->ll, *rr = WORK->rr;
+                render(sl, ll, rr, n);
+                fx(s, sl, ll, rr, n);
+                for (int j = 0; j < n; j++) {
+                    l[j] += ll[j];
+                    r[j] += rr[j];
+                }
+            }
+        }
+    }
+    return fw_stock_proc(obj, ctx);
 }
