@@ -91,7 +91,20 @@ def feature_loop():
                               "loop4_free": CAVE4[1] - len(code4)}
 
 
-FEATURES = {"loop": feature_loop}
+def m4_site(addr):
+    return addr >= 0x08100000 or CAVE4[0] <= addr < CAVE4[0] + CAVE4[1]
+
+
+def feature_loop_part(m4):
+    """half of the loop (M4: files, UI, parameters / M7: the engine), to find on the device which half stops the boot"""
+    patches, targets, sizes = feature_loop()
+    return [p for p in patches if m4_site(p[0]) == m4], targets, sizes
+
+
+FEATURES = {"loop": feature_loop, "ver": lambda: ([], {}, {}),
+            "loop_m4": lambda: feature_loop_part(True), "loop_m7": lambda: feature_loop_part(False)}
+# boot test builds: each marks itself on the settings page
+TEST_VERSIONS = {"ver": b"1.5.1T1\0", "loop_m4": b"1.5.1T2\0", "loop_m7": b"1.5.1T3\0"}
 
 
 def main(args):
@@ -106,8 +119,9 @@ def main(args):
         patches += p
         targets.update(t)
         sizes.update(sz)
+    version = TEST_VERSIONS.get(names[0], VERSION[2]) if len(names) == 1 else VERSION[2]
     if names:
-        patches.append((VERSION[0], VERSION[1], VERSION[2], "version string"))
+        patches.append((VERSION[0], VERSION[1], version, "version string"))
     ranges = []
     for addr, old, new, what in patches:
         o = addr - BASE
@@ -135,7 +149,7 @@ def main(args):
     os.makedirs(d, exist_ok=True)
     out = os.path.join(d, "BLUEEURO.BIN")
     open(out, "wb").write(data)
-    info = {"stock_sha256": STOCK_SHA256, "features": names, "version": VERSION[2].rstrip(b"\0").decode(),
+    info = {"stock_sha256": STOCK_SHA256, "features": names, "version": version.rstrip(b"\0").decode(),
             "sha256": hashlib.sha256(data).hexdigest(), "size": len(data), "changed_bytes": len(changed),
             "cave_bytes": sizes}
     json.dump(info, open(os.path.join(d, "build.json"), "w"), indent=2)

@@ -18,6 +18,10 @@ that every BL lands on its symbol. The version string on the settings page marks
 | `loop` UI | Track page, B key | Loop view: FILTER / BARS / FADE knobs with their values, LOOP button showing the state; BL 0x08135BA2, 0x08135718, 0x08135720, page vtable 0x0814E608 | Renode (screenshots) |
 | `loop` params | channel parameters | BARS (0x104, 1..16, `chloopbars`), FILTER (0x105, `chloopfilt`), FADE (0x107, 0..16 bars, `chloopfade`), saved with the project; LOOP (0x103, `chloop`) stays defined but unused; BL 0x0813714A -> `loop_defs`, 0x0812087C -> `loop_set_add` | Unicorn |
 
+Boot test builds (L9 still shows a black screen at boot on the device, 2026-11-01): `build.py ver` (version string
+only, `1.5.1T1`), `build.py loop_m4` (M4 half: parameters, Loop view, files; `1.5.1T2`), `build.py loop_m7` (M7 half:
+the engine on the channel node; `1.5.1T3`). Each goes to `out/bluebox/<name>/BLUEEURO.BIN`.
+
 ## On the device
 
 Track page, **B** (Info) twice: block 1 -> block 2 -> **Loop view** -> block 1. Encoders 1 FILTER, 2 BARS, 3 FADE;
