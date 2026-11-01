@@ -20,7 +20,8 @@ that every BL lands on its symbol. The version string on the settings page marks
 
 Boot test builds (L9 still shows a black screen at boot on the device, 2026-11-01): `build.py ver` (version string
 only, `1.5.1T1`), `build.py loop_m4` (M4 half: parameters, Loop view, files; `1.5.1T2`), `build.py loop_m7` (M7 half:
-the engine on the channel node; `1.5.1T3`). Each goes to `out/bluebox/<name>/BLUEEURO.BIN`.
+the engine on the channel node; `1.5.1T3`). Device: T3 boots, T2 stays black. Split of T2: `build.py
+loop_m4_tick` (only the UI loop hook `loop_tick`; `1.5.1T4`), `build.py loop_m4_ui` (T2 without it; `1.5.1T5`). Each goes to `out/bluebox/<name>/BLUEEURO.BIN`.
 
 ## On the device
 

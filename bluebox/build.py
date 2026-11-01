@@ -101,10 +101,19 @@ def feature_loop_part(m4):
     return [p for p in patches if m4_site(p[0]) == m4], targets, sizes
 
 
+def feature_loop_tick(tick):
+    """M4 half split again: only the UI loop's loop_tick hook (with the cave) / everything of the M4 half but it"""
+    patches, targets, sizes = feature_loop_part(True)
+    keep = [p for p in patches if p[3].endswith("cave") or (p[0] == 0x081351A6) == tick]
+    return keep, targets, sizes
+
+
 FEATURES = {"loop": feature_loop, "ver": lambda: ([], {}, {}),
-            "loop_m4": lambda: feature_loop_part(True), "loop_m7": lambda: feature_loop_part(False)}
+            "loop_m4": lambda: feature_loop_part(True), "loop_m7": lambda: feature_loop_part(False),
+            "loop_m4_tick": lambda: feature_loop_tick(True), "loop_m4_ui": lambda: feature_loop_tick(False)}
 # boot test builds: each marks itself on the settings page
-TEST_VERSIONS = {"ver": b"1.5.1T1\0", "loop_m4": b"1.5.1T2\0", "loop_m7": b"1.5.1T3\0"}
+TEST_VERSIONS = {"ver": b"1.5.1T1\0", "loop_m4": b"1.5.1T2\0", "loop_m7": b"1.5.1T3\0",
+                 "loop_m4_tick": b"1.5.1T4\0", "loop_m4_ui": b"1.5.1T5\0"}
 
 
 def main(args):
