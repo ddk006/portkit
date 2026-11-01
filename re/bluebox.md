@@ -274,3 +274,12 @@ aufnehmen und von SD abspielen, Ausblenden mit Filter. Projektwechsel (= "Preset
 - Einhängepunkt: noch offen; Kandidaten sind die Kanalkette (Bus 0..11 vor dem Mixer `b988`) oder der Mixer selbst.
 - Tempo: `globtempo` (0x085); Clock-Quelle/Taktposition im M7 noch nicht gefunden.
 - Preset-/Projektwechsel: Ablauf (`SessionMgr`, `PresetMgr`) noch nicht untersucht.
+
+### Schwarzer Bildschirm L8/L9: Ursache (hardware-bestätigt per Bisektion, 2026-11-01)
+- Testbuilds am Gerät: T3 (nur M7) bootet, T2 (nur M4) schwarz; T4 (nur `loop_tick`) bootet, T5 (M4 ohne
+  `loop_tick`: Parameter, Loop-Ansicht) schwarz.
+- `struct loop_ui` bekam in L8 `acc[3]`, `text[16]`, `lit` (1 Byte) vor den Widget-Objekten: Knobs ab Offset 61,
+  Button ab 2989 (L7: 32 / 2960). Die Stock-Konstruktoren schreiben mit STRD/STM; unausgerichtet -> UsageFault auf
+  dem Cortex-M4. Renode toleriert unausgerichtete Zugriffe, Unicorn auch.
+- Fix LA: `aligned(8)` und `_Static_assert` auf die Offsets. Ob LA bootet: noch nicht am Gerät.
+

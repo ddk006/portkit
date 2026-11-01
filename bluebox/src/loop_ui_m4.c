@@ -77,8 +77,11 @@ struct loop_ui {
     int32_t acc[UI_KNOBS];                  /* encoder counts not yet turned into a step */
     char text[16];                          /* the LOOP button's text as shown */
     uint8_t lit;
-    uint8_t knob[UI_KNOBS][KNOB_SIZE];      /* FILTER, BARS, FADE (encoders 1, 2, 3) */
-    uint8_t btn[BTN_SIZE];                  /* LOOP */
+    /* widget objects: 8-byte aligned. L8/L9 put them at odd offsets (61, 2989) after the byte `lit`; the stock
+     * constructors use STRD / STM, which fault on an unaligned address on the Cortex-M4: black screen at boot on the
+     * device (bisected with test builds T2 / T5; Renode tolerates unaligned accesses) */
+    uint8_t knob[UI_KNOBS][KNOB_SIZE] __attribute__((aligned(8)));   /* FILTER, BARS, FADE (encoders 1, 2, 3) */
+    uint8_t btn[BTN_SIZE] __attribute__((aligned(8)));               /* LOOP */
     uint32_t btn_vt[18];                    /* the button's vtable: the stock one with our tap method */
 };
 #define UI ((struct loop_ui *)0x3800A000u)
@@ -88,6 +91,8 @@ struct loop_ui {
  * Track page's constructor, before our widgets are built) invalidates the UI and the shared loop state. On the device L8 had
  * no such check: black screen at boot (status() followed garbage pointers; the simulation starts with SRAM4 zeroed). */
 #define UI_OK (UI->magic == UI_MAGIC && UI->built == 1)
+_Static_assert(__builtin_offsetof(struct loop_ui, knob) % 8 == 0 && KNOB_SIZE % 8 == 0 &&
+               __builtin_offsetof(struct loop_ui, btn) % 8 == 0, "widget objects 8-byte aligned (STRD / STM on the M4)");
 _Static_assert(sizeof(struct loop_ui) < 0x5000, "SRAM4 0x3800A000.. below the M7 state at 0x3800F000");
 
 static const uint16_t KID[UI_KNOBS] = { P_FILTER, P_BARS, P_FADE };

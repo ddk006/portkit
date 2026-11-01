@@ -9,7 +9,7 @@ python3 bluebox/build.py loop                         # -> out/bluebox/loop/BLUE
 ```
 
 The build checks every patch site against its stock bytes, that every changed byte lies in a registered range and
-that every BL lands on its symbol. The version string on the settings page marks the build (`1.5.1L9`).
+that every BL lands on its symbol. The version string on the settings page marks the build (`1.5.1LA`).
 
 | Feature | Where | What | Status |
 |---|---|---|---|
@@ -21,7 +21,10 @@ that every BL lands on its symbol. The version string on the settings page marks
 Boot test builds (L9 still shows a black screen at boot on the device, 2026-11-01): `build.py ver` (version string
 only, `1.5.1T1`), `build.py loop_m4` (M4 half: parameters, Loop view, files; `1.5.1T2`), `build.py loop_m7` (M7 half:
 the engine on the channel node; `1.5.1T3`). Device: T3 boots, T2 stays black. Split of T2: `build.py
-loop_m4_tick` (only the UI loop hook `loop_tick`; `1.5.1T4`), `build.py loop_m4_ui` (T2 without it; `1.5.1T5`). Each goes to `out/bluebox/<name>/BLUEEURO.BIN`.
+loop_m4_tick` (only the UI loop hook `loop_tick`; `1.5.1T4`), `build.py loop_m4_ui` (T2 without it; `1.5.1T5`).
+Device: T4 boots, T5 stays black. Cause: since L8 the Loop view's widget objects sat at odd addresses in SRAM4 (after a
+byte field); the stock constructors' STRD / STM fault on that on the Cortex-M4 (Renode tolerates it). Fixed in LA
+(aligned, static assert). Each goes to `out/bluebox/<name>/BLUEEURO.BIN`.
 
 ## On the device
 
@@ -70,14 +73,14 @@ Renode (fresh card, 120 BPM, BARS 1, 440 Hz at the input of track 1, input silen
   (the loop) through the end of the capture, no missing block, M7 alive.
 - Same with track 3 armed and recording (REC) meanwhile: the take of track 3 is written, the loop of track 1 plays.
 
-## Device test (build 1.5.1L9)
+## Device test (build 1.5.1LA)
 
-L8 installed but the screen stayed black at boot (Kyrill, 2026-11-01). L9 fixes the probable cause (above); that
-cause is not proven on the device, and the MPU change has not run on hardware.
+L8 and L9 stayed black at boot on the device (2026-11-01); the boot test builds found the misaligned widgets (above).
+LA is L9 with them aligned. The MPU change (SRAM4 not cached on the M7) has not run on hardware yet (T3 booted with it).
 
 
 1. Keep the stock `BLUEEURO.BIN` (1.5.1) for going back. Copy `out/bluebox/loop/BLUEEURO.BIN` to the SD root and
-   install as for bluelex (power on with A held). Settings page shows `1.5.1L9`. If the screen stays black: install the stock file again and report it.
+   install as for bluelex (power on with A held). Settings page shows `1.5.1LA`. If the screen stays black: install the stock file again and report it.
 2. PLAY. Track page, B twice. Turn the knobs: values in the labels, BARS / FADE one step at a time.
 3. Play into a track, set BARS 2, press LOOP: `ARMED`, then `REC 1/2`, `REC 2/2`, `WAIT`, `PLAY 1/2`... Listen for
    the loop starting in time, clean jumps (no click), the level against the live signal.
