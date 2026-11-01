@@ -253,6 +253,22 @@ aufnehmen und von SD abspielen, Ausblenden mit Filter. Projektwechsel (= "Preset
   - Regler: Typ-1-Regler (ganze Zahl) bewegen sich einen Wert je Encoder-Zähler (0x0812877C: Wert = min + Position),
     VOL braucht ~2000 Zähler; eigene Schritte (BARS / FADE 96 Zähler, FILTER 1 % je 8). Die Stock-Drehung bewegte
     FILTER (Typ 9) in der Simulation nicht. Werte in den Beschriftungen (snprintf 0x08146156).
+- **L8 am Gerät (Kyrill, 2026-11-01): Installation geht, Bildschirm bleibt beim Boot schwarz.** L7 bootete.
+  - M7-MPU (0x0805D974, HAL_MPU_ConfigRegion 0x0805E318, Enable mit PRIVDEFENA): Regionen 0 DTCM 128 KB (C/B),
+    1 0x24000000 256 KB (C/B), 2 0x24040000 64 KB (C/B), 3..5 0x24050000 / 0x24060000 / 0x24070000 je 64 KB
+    nicht cachebar, 6 0x30000000 512 KB (C/B), 7 Flash 2 MB, 8 SDRAM 0xC0000000 64 MB (C/B), 9 0x40000000 512 MB
+    (Device), 10 0x60000000, 11 0x1FF0F000, 12 0x10040000 64 KB (shareable: der Austausch der Stock-Firmware).
+    **SRAM4 0x38000000 liegt in keiner Region**: für den M7 Standard-Attribut, Write-Back-Cache (D-Cache an,
+    0x0805DD52). M7 und M4 sähen dort ihre Schreibzugriffe nicht zuverlässig (der M4 hat keinen Cache).
+  - Wahrscheinliche Ursache des schwarzen Bildschirms (nicht am Gerät bewiesen): `loop_tick` (UI-Schleife, ab dem
+    Start) las in L8 die Widget-Daten in SRAM4 ohne Gültigkeitsprüfung; nach dem Einschalten steht dort Zufall ->
+    Müllzeiger. Renode startet mit genulltem SRAM4 und toleriert ungültige Zeiger (Boot mit 0xA5 in SRAM4 lief).
+  - L9: alle M4-Einstiege prüfen Magic + `built`; der Konstruktor der Track-Seite (`loop_track_ctor`, vor dem
+    Stock-Konstruktor) setzt UI und gemeinsamen Zustand ungültig. Erster Versuch in `loop_defs` war falsch: die
+    Parametertabelle wird in Renode *nach* der Track-Seite aufgebaut, der Reset machte die Loop-Ansicht ungültig
+    (Ansicht fehlte, Slots IDLE). Offen: nach einem Warmstart läge bis zum Konstruktor ein gültiges altes Magic in
+    SRAM4 (nur Zeitfenster vor dem Aufbau der Track-Seite); der M7 richtet beim ersten Aufruf MPU-Region 13 für SRAM4 ein (normal, nicht
+    cachebar, TEX 1 C 0 B 0) und schreibt vorher gecachte Zeilen zurück (DCCIMVAC).
 - RAM-Rechnung: frei ~6,4 MB (1,5 + 4,9). 24 Bit mono 3 MB je Slot = 21,8 s (16 Takte nur ab ~176 BPM),
   stereo 10,9 s. Daher SD.
 - Einhängepunkt: noch offen; Kandidaten sind die Kanalkette (Bus 0..11 vor dem Mixer `b988`) oder der Mixer selbst.

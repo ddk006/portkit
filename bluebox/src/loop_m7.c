@@ -60,6 +60,32 @@ struct work { float ll[MAXN], rr[MAXN], tl[MAXN], tr[MAXN]; };
 #define WORK ((struct work *)0x38008000u)
 _Static_assert(sizeof(struct work) <= 0x2000, "SRAM4 0x38008000..0x3800A000 (the M4 UI starts at 0x3800A000)");
 
+/* SRAM4 is shared with the M4 (no cache) but lies in no region of the stock MPU setup (0x0805D974: regions 0..12, the
+ * stock's shared D2 RAM 0x10040000 as region 12, shareable), so the M7 caches it write-back by default: the cores
+ * would not see each other's writes on the device (the simulation has no cache). Region 13 (free) makes
+ * 0x38000000..0x38010000 normal non-cacheable memory; lines cached before are written back and dropped first.
+ * Done on the first call (and again should the region ever be off). */
+#define MPU_RNR (*(volatile uint32_t *)0xe000ed98u)
+#define MPU_RBAR (*(volatile uint32_t *)0xe000ed9cu)
+#define MPU_RASR (*(volatile uint32_t *)0xe000eda0u)
+#define DCCIMVAC (*(volatile uint32_t *)0xe000ef70u)
+#define SRAM4_RASR ((1u << 28) | (3u << 24) | (1u << 19) | (15u << 1) | 1u)   /* XN, RW, TEX 1 C 0 B 0, 64 KB */
+
+static void sram4_uncached(void)
+{
+    MPU_RNR = 13;
+    if (MPU_RASR == SRAM4_RASR)
+        return;
+    __asm volatile("dsb" ::: "memory");
+    for (uint32_t a = 0x38000000u; a < 0x38010000u; a += 32)
+        DCCIMVAC = a;
+    __asm volatile("dsb" ::: "memory");
+    MPU_RASR = 0;
+    MPU_RBAR = 0x38000000u;
+    MPU_RASR = SRAM4_RASR;
+    __asm volatile("dsb\n isb" ::: "memory");
+}
+
 static struct loop_shared *state(void)
 {
     struct loop_shared *s = (struct loop_shared *)LOOP_SHARED;
@@ -429,6 +455,7 @@ static void run_slot(struct loop_slot *sl, const uint8_t *t, float *l, float *r,
 
 int loop_process(void *obj, void *ctx)
 {
+    sram4_uncached();
     struct loop_shared *s = state();
     unsigned track = *(uint32_t *)((uint8_t *)obj + P_QUEUE);
     if (track >= LOOP_TRACKS || !ctx)

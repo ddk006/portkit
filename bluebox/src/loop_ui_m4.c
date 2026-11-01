@@ -83,6 +83,11 @@ struct loop_ui {
 };
 #define UI ((struct loop_ui *)0x3800A000u)
 #define UI_MAGIC 0x4955504cu                /* "LPUI" */
+/* SRAM4 holds anything after power-on (and the last run's state after a warm reset); the stock code runs the UI loop
+ * and shows pages before the Track page is built. Everything here checks UI_OK first, and loop_ui_reset (from the
+ * Track page's constructor, before our widgets are built) invalidates the UI and the shared loop state. On the device L8 had
+ * no such check: black screen at boot (status() followed garbage pointers; the simulation starts with SRAM4 zeroed). */
+#define UI_OK (UI->magic == UI_MAGIC && UI->built == 1)
 _Static_assert(sizeof(struct loop_ui) < 0x5000, "SRAM4 0x3800A000.. below the M7 state at 0x3800F000");
 
 static const uint16_t KID[UI_KNOBS] = { P_FILTER, P_BARS, P_FADE };
@@ -135,8 +140,10 @@ static void loop_btn_tap(void *w, int a, int b)
 void loop_ui_build(void *page);
 typedef void (*page_ctor_fn)(void *page);
 #define fw_track_ctor ((page_ctor_fn)FN(0x08133470))
+void loop_ui_reset(void);
 void loop_track_ctor(void *page)
 {
+    loop_ui_reset();                        /* SRAM4 holds garbage (power-on) or the last run's state */
     fw_track_ctor(page);
     loop_ui_build(page);
 }
@@ -144,7 +151,7 @@ void loop_track_ctor(void *page)
 void loop_ui_build(void *page)
 {
     struct loop_ui *u = UI;
-    u->magic = UI_MAGIC;
+    u->built = 0;
     u->view = 0;
     u->was_current = 0;
     u->pm = 0;
@@ -178,6 +185,17 @@ void loop_ui_build(void *page)
     u->text[0] = 0;
     u->lit = 0xff;
     u->built = 1;
+    u->magic = UI_MAGIC;                    /* last: valid from here on */
+}
+
+/* from loop_track_ctor; not from loop_defs: the parameter table is set up after the Track page (Renode L9) */
+void loop_ui_reset(void)
+{
+    UI->magic = 0;
+    UI->built = 0;
+    UI->view = 0;
+    UI->pm = 0;
+    LOOP_SHARED->magic = 0;                 /* the M7 starts its loop state afresh */
 }
 
 /* Values in the knob labels ("BARS 4", "LP 35%"): the stock knobs show only their label here.
@@ -272,7 +290,7 @@ static void refresh(void *page)
 static void apply(void *page)
 {
     struct loop_ui *u = UI;
-    if (!u->built)
+    if (!UI_OK)
         return;
     for (int i = 0; i < N_KNOB; i++)
         if (u->view && !hidden(KNOB(page, i)))
@@ -319,7 +337,7 @@ void loop_show(void *pm, void *page)
     struct loop_ui *u = UI;
     u->pm = pm;
     u->was_current = *(void **)((uint8_t *)pm + 0x34) == page;
-    if (!u->was_current && u->built && page == u->page)
+    if (!u->was_current && UI_OK && page == u->page)
         leave(page);                        /* the Track page opens fresh: stock view */
     fw_show(pm, page);
 }
@@ -328,7 +346,7 @@ void loop_show(void *pm, void *page)
 void loop_setblock(void *page, int block)
 {
     struct loop_ui *u = UI;
-    if (!u->built || page != u->page || !u->was_current) {
+    if (!UI_OK || page != u->page || !u->was_current) {
         fw_setblock(page, block);
         return;
     }
@@ -348,14 +366,14 @@ void loop_msg(void *page, void *msg)
 {
     struct loop_ui *u = UI;
     uint16_t code = *(uint16_t *)msg;
-    if (u->built && u->view && page == u->page && code == 0x32) {
+    if (UI_OK && u->view && page == u->page && code == 0x32) {
         int enc = *(int16_t *)((uint8_t *)msg + 0x0c), delta = *(int32_t *)((uint8_t *)msg + 0x10);
         if (enc >= 0 && enc < UI_KNOBS)
             turn(page, enc, delta);
         return;
     }
     fw_page_msg(page, msg);
-    if (u->built && u->view && page == u->page &&
+    if (UI_OK && u->view && page == u->page &&
         (code == 0x63 || code == 0x66 || code == 0x67 || code == 0x141 || code == 0xd4)) {
         refresh(page);
         apply(page);                        /* a refresh / layout may have shown stock widgets again */
@@ -403,7 +421,7 @@ static void files(void)
 static void status(void)
 {
     struct loop_ui *u = UI;
-    if (!u->built || !u->view || !u->page)
+    if (!UI_OK || !u->view || !u->page)
         return;
     volatile struct loop_shared *s = LOOP_SHARED;
     unsigned track = *(uint16_t *)((uint8_t *)u->page + PG_TRACK);

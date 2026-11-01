@@ -94,6 +94,7 @@ class Emu:
         uc.mem_map(0x10040000, 0x10000)                 # the cache object (asset map) as the M7 sees it
         uc.mem_map(0x30000000, 0x50000)                 # M4 SRAM (stream manager, store)
         uc.mem_map(DATA, 0x1000000)
+        uc.mem_map(0xE000E000, 0x1000)                 # SCB / MPU registers (sram4_uncached)
         self.next_desc = 1
         self.next_data = DATA
         uc.mem_write(RET, b"\x00\xbe")                  # bkpt: end of a call
@@ -429,7 +430,12 @@ def main():
     check(st_b in pre and st_b + 1 in pre, "the loop start's blocks are requested ahead of the jump (first run: %d requests)"
           % len(pre))
 
-    # --- M4: file requests and parameters
+    # --- SRAM4 uncached on the M7 (MPU region 13), set once
+    rasr = struct.unpack("<IIII", bytes(e.uc.mem_read(0xE000ED94, 16)))
+    check(rasr[1] == 13 and rasr[2] == 0x38000000 and rasr[3] == ((1 << 28) | (3 << 24) | (1 << 19) | (15 << 1) | 1),
+          "M7: MPU region 13 makes SRAM4 non-cacheable (RNR %d, RBAR %#x, RASR %#x)" % rasr[1:])
+
+
     m4 = Emu()
     m4.uc.mem_write(STATE, struct.pack("<I", 0x384F4F4C))
     base = lambda i: STATE + OFF_SLOT + i * SLOT_SIZE
@@ -447,6 +453,28 @@ def main():
     m4.call(tick, 0x30010000, 0)
     check([c for c in m4.m4_calls if c[0] in ("open_w", "close", "open_r")] == [("close", 0x1FD, "", 0, 0)],
           "M4: cancel closes the file only")
+    # --- M4: garbage in SRAM4 at boot (power-on) must not be followed; the Track page's ctor resets the state
+    g = Emu()
+    g.uc.mem_write(0x3800A000, b"\xa5" * 0x6000)        # UI struct and shared state: garbage, as after power-on
+    g.call(tick, 0x30010000, 0)                         # the UI loop runs before the Track page exists
+    check(True, "M4: loop_tick with garbage in SRAM4 returns (no widget access)")
+    g.call(symbol("loop_ui_reset", "loop4.elf"))
+    rd = lambda a: struct.unpack("<I", bytes(g.uc.mem_read(a, 4)))[0]
+    check(rd(0x3800A000) == 0 and rd(STATE) == 0, "M4: loop_ui_reset invalidates the UI and the shared state")
+    g.uc.mem_write(0x3800A000, b"\xa5" * 0x6000)
+    seen = []
+    def at_stock_ctor(uc, addr, size, _):            # the stock Track page ctor: stop there, the reset must be done
+        seen.append((rd(0x3800A000), rd(STATE)))
+        uc.emu_stop()
+    g.uc.hook_add(UC_HOOK_CODE, at_stock_ctor, begin=0x08133470, end=0x08133470)
+    g.uc.reg_write(UC_ARM_REG_SP, 0x3000F000)
+    g.uc.reg_write(UC_ARM_REG_LR, 0x3000F001)
+    g.uc.emu_start(symbol("loop_track_ctor", "loop4.elf") | 1, 0x3000F000, count=10000)
+    check(seen == [(0, 0)], "M4: loop_track_ctor resets UI and shared state before the stock ctor: %s" % seen)
+    m4.uc.mem_write(0x3800A000, struct.pack("<I", 0x4955504C))
+    m4.call(symbol("loop_defs", "loop4.elf"), 0x30000000, 0x117, 4, 0x08149000)
+    check(struct.unpack("<I", bytes(m4.uc.mem_read(0x3800A000, 4)))[0] == 0x4955504C,
+          "M4: loop_defs (runs after the Track page) leaves the Loop view valid")
     m4.m4_calls = []
     for name, args in (("loop_defs", (0x30000000, 0x117, 4, 0x08149000)), ("loop_set_add", (0x30000100, 0x2A, 500))):
         m4.call(symbol(name, "loop4.elf"), *args)

@@ -9,11 +9,11 @@ python3 bluebox/build.py loop                         # -> out/bluebox/loop/BLUE
 ```
 
 The build checks every patch site against its stock bytes, that every changed byte lies in a registered range and
-that every BL lands on its symbol. The version string on the settings page marks the build (`1.5.1L8`).
+that every BL lands on its symbol. The version string on the settings page marks the build (`1.5.1L9`).
 
 | Feature | Where | What | Status |
 |---|---|---|---|
-| `loop` engine | channel node after the EQ | records a track's output into its own WAV on the SD card from the next bar line for BARS bars, then loops it into the same track (crossfaded, FILTER, FADE); independent of the track recorder; 2 slots; M7 cave 0x0808C000, vtable 0x0806BF80 -> `loop_process` | Unicorn: 29/29; Renode: see below; not on hardware |
+| `loop` engine | channel node after the EQ | records a track's output into its own WAV on the SD card from the next bar line for BARS bars, then loops it into the same track (crossfaded, FILTER, FADE); independent of the track recorder; 2 slots; M7 cave 0x0808C000, vtable 0x0806BF80 -> `loop_process` | Unicorn: 34/34; Renode: see below; not on hardware |
 | `loop` files | M4 UI loop | opens / closes the loop files at the stock stream manager; M4 cave 0x0808E000, BL 0x081351A6 -> `loop_tick` | Unicorn, Renode |
 | `loop` UI | Track page, B key | Loop view: FILTER / BARS / FADE knobs with their values, LOOP button showing the state; BL 0x08135BA2, 0x08135718, 0x08135720, page vtable 0x0814E608 | Renode (screenshots) |
 | `loop` params | channel parameters | BARS (0x104, 1..16, `chloopbars`), FILTER (0x105, `chloopfilt`), FADE (0x107, 0..16 bars, `chloopfade`), saved with the project; LOOP (0x103, `chloop`) stays defined but unused; BL 0x0813714A -> `loop_defs`, 0x0812087C -> `loop_set_add` | Unicorn |
@@ -45,7 +45,11 @@ each recording overwrites the older file of its slot. Loops do not survive a pro
 ## How it works
 
 State shared by both cores in SRAM4 0x3800F000 (`src/loop_shared.h`), M7 work buffers at 0x38008000, M4 widgets at
-0x3800A000. Details and evidence in `re/bluebox.md` ("Looper L8").
+0x3800A000. Details and evidence in `re/bluebox.md` ("Looper L8", "L8 black screen").
+- SRAM4 after power-on holds garbage, and the M7 caches it by default (no MPU region covers 0x38000000). L9:
+  the M4 code touches its widgets only once the UI struct is valid (magic written last by the build); the Track
+  page's constructor first invalidates the UI and the shared loop state; the M7 sets up MPU region 13 for SRAM4 as
+  shareable, not cacheable (after cleaning its cache lines), so both cores see the same state.
 - M7 (`src/loop_m7.c`, `loop_process` replaces the process of channel node 0x0806BF74): takes BARS / FILTER / FADE
   from the track's events; per block it first writes the bus to the slot's asset (0x1FC + 2 slot + generation) via the
   stream cache's write (vtable[0], 0x0805AD08), then adds the playing loop. The loop is read from the cache by our
@@ -61,10 +65,14 @@ Renode (fresh card, 120 BPM, BARS 1, 440 Hz at the input of track 1, input silen
   (the loop) through the end of the capture, no missing block, M7 alive.
 - Same with track 3 armed and recording (REC) meanwhile: the take of track 3 is written, the loop of track 1 plays.
 
-## Device test (build 1.5.1L8, not flashed yet)
+## Device test (build 1.5.1L9)
+
+L8 installed but the screen stayed black at boot (Kyrill, 2026-11-01). L9 fixes the probable cause (above); that
+cause is not proven on the device, and the MPU change has not run on hardware.
+
 
 1. Keep the stock `BLUEEURO.BIN` (1.5.1) for going back. Copy `out/bluebox/loop/BLUEEURO.BIN` to the SD root and
-   install as for bluelex (power on with A held). Settings page shows `1.5.1L8`.
+   install as for bluelex (power on with A held). Settings page shows `1.5.1L9`. If the screen stays black: install the stock file again and report it.
 2. PLAY. Track page, B twice. Turn the knobs: values in the labels, BARS / FADE one step at a time.
 3. Play into a track, set BARS 2, press LOOP: `ARMED`, then `REC 1/2`, `REC 2/2`, `WAIT`, `PLAY 1/2`... Listen for
    the loop starting in time, clean jumps (no click), the level against the live signal.
